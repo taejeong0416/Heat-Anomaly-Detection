@@ -1,0 +1,12 @@
+# 대용량 데이터 파일 (로컬에서만 관리)
+data/
+2021/
+2022/
+2023/
+2024/
+2025/
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
