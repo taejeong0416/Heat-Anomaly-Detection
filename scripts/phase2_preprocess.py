@@ -153,24 +153,46 @@ print(f'    지사 상위5: {nan24_branch}')
 df = df[~mask24]
 log_step(f'NaN=24 행 제거: -{n_nan24:,}행')
 
-# NaN 4~23
+# NaN 3~23
 nan_count = df[HOUR_COLS].isnull().sum(axis=1)
-mask_partial = (nan_count >= 4) & (nan_count <= 23)
+mask_partial = (nan_count >= 3) & (nan_count <= 23)
 n_partial = mask_partial.sum()
 df = df[~mask_partial]
-log_step(f'NaN 4~23 행 제거: -{n_partial:,}행')
+log_step(f'NaN 3~23 행 제거: -{n_partial:,}행')
 
-# NaN 1~3 보간
+# NaN 1~2 보간
 nan_count = df[HOUR_COLS].isnull().sum(axis=1)
-interp_mask = (nan_count >= 1) & (nan_count <= 3)
+interp_mask = (nan_count >= 1) & (nan_count <= 2)
 n_interp = interp_mask.sum()
-print(f'  NaN 1~3 보간 대상: {n_interp:,}행')
+print(f'  NaN 1~2 보간 대상: {n_interp:,}행')
 
-df['보간'] = interp_mask.values
+# 보간 상세 정보 저장: NaN 개수 + 최대 연속 NaN 길이
+df['보간_개수'] = 0
+df.loc[interp_mask, '보간_개수'] = nan_count[interp_mask].astype(int)
 
-# 보간 (행 단위 선형)
+def _max_consecutive_nan_batch(hour_data):
+    """행별 최대 연속 NaN 길이 계산 (벡터화)"""
+    is_nan = hour_data.isnull().values  # shape: (n_rows, 24)
+    max_runs = np.zeros(len(is_nan), dtype=int)
+    current = np.zeros(len(is_nan), dtype=int)
+    for col_idx in range(24):
+        mask_col = is_nan[:, col_idx]
+        current = np.where(mask_col, current + 1, 0)
+        max_runs = np.maximum(max_runs, current)
+    return max_runs
+
+df['보간_최대연속'] = 0
 if n_interp > 0:
     idx = df.index[interp_mask]
+    df.loc[idx, '보간_최대연속'] = _max_consecutive_nan_batch(df.loc[idx, HOUR_COLS])
+
+    # 연속 NaN 분포 출력
+    consec_dist = df.loc[idx, '보간_최대연속'].value_counts().sort_index()
+    print(f'  최대 연속 NaN 분포:')
+    for k, v in consec_dist.items():
+        print(f'    연속 {k}개: {v:,}건 ({v/n_interp*100:.1f}%)')
+
+    # 보간 (행 단위 선형)
     df.loc[idx, HOUR_COLS] = df.loc[idx, HOUR_COLS].interpolate(
         axis=1, method='linear', limit_direction='both'
     )
@@ -180,7 +202,7 @@ if n_interp > 0:
         if m.any():
             df.loc[m, col] = 0
 
-log_step(f'NaN 1~3 보간: {n_interp:,}행')
+log_step(f'NaN 1~2 보간: {n_interp:,}행')
 remaining_nan = df[HOUR_COLS].isnull().sum().sum()
 print(f'  NaN 잔존: {remaining_nan}건')
 gc.collect()
@@ -217,7 +239,7 @@ checks = {}
 checks['neg_hourly'] = int((df[HOUR_COLS] < 0).sum().sum())
 checks['nan_hourly'] = int(df[HOUR_COLS].isnull().sum().sum())
 checks['neg_total'] = int((df['총사용량'] < 0).sum())
-checks['interp_rate'] = round(df['보간'].sum() / len(df) * 100, 3)
+checks['interp_rate'] = round((df['보간_개수'] > 0).sum() / len(df) * 100, 3)
 
 original_counts = {'주택용': 8399121, '업무용': 6468701, '공공용': 1788904}
 checks['removal_rates'] = {}
