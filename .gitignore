@@ -1,5 +1,8 @@
 # 대용량 데이터 파일 (로컬에서만 관리)
 data/
+!data/processed/
+data/processed/*
+!data/processed/all_data.parquet
 2021/
 2022/
 2023/
