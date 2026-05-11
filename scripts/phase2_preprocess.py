@@ -77,8 +77,7 @@ def step2_offset_negative_processing(df):
       Case 2 (합 > 0, 영향구간 ≤ 1시간): 합을 분배 보간
       Case 3 (합 > 0, 영향구간 > 1시간): NaN (자동 운영 보수 정책)
     """
-    df = df.copy()
-    data_array = df[HOUR_COLS].values.astype(float)
+    data_array = df[HOUR_COLS].values.astype(np.float32)
 
     has_negative = (data_array < 0).any(axis=1)
     rows_with_neg = np.where(has_negative)[0]
@@ -161,9 +160,12 @@ def step3_no_offset_negative_to_nan(df):
     3단계: 무상쇄 음수 NaN 처리 (PNNL Section 2.4.2)
     인접 양수가 없는 잔여 음수 → NaN 변환
     """
-    df = df.copy()
-    n_converted = (df[HOUR_COLS] < 0).sum().sum()
-    df[HOUR_COLS] = df[HOUR_COLS].where(~(df[HOUR_COLS] < 0), np.nan)
+    n_converted = 0
+    for col in HOUR_COLS:
+        m = df[col] < 0
+        n_converted += m.sum()
+        if m.any():
+            df.loc[m, col] = np.nan
 
     log_step(f'[3단계] 무상쇄 음수 NaN 처리 (PNNL 2.4.2): {n_converted:,}개 셀')
     return df
@@ -198,8 +200,7 @@ def step5_consecutive_nan_filter(df):
       연속 NaN ≥ 2 → 일자 제거
     근거: PNNL Section 3 Option 2 원문 — "only ≤ 1 hour gaps be filled"
     """
-    df = df.copy()
-    data_array = df[HOUR_COLS].values.astype(float)
+    data_array = df[HOUR_COLS].values.astype(np.float32)
 
     rows_to_remove = []
     rows_to_interpolate = []
@@ -256,9 +257,6 @@ def step6_min_observation_filter(df):
     6단계: 관측 기간 < 1년 설비 제거
     근거: Quesada et al. (2024) — 계절 패턴 1사이클 필요
     """
-    df = df.copy()
-    df[DATE_COL] = pd.to_datetime(df[DATE_COL])
-
     facility_span = df.groupby(FACILITY_COL)[DATE_COL].agg(['min', 'max'])
     facility_span['days'] = (facility_span['max'] - facility_span['min']).dt.days
 
@@ -275,17 +273,14 @@ def step6_min_observation_filter(df):
     return df
 
 
-def step7_high_missing_facility_filter(df, df_original):
+def step7_high_missing_facility_filter(df, facility_nan_rate):
     """
     7단계: 결측률 ≥ 28% 설비 제거
     근거: 데이터 분포 시각화 분석 — 27~28% 구간에 16개 → 28% 이후 0~1개 급감 (단절점)
+    facility_nan_rate: 원본 데이터 기준 설비별 결측률 (pre-computed)
     """
-    facility_missing = df_original.groupby(FACILITY_COL).apply(
-        lambda x: x[HOUR_COLS].isna().sum().sum() / (len(x) * 24)
-    )
-
-    facilities_to_keep = facility_missing[
-        facility_missing < MAX_MISSING_RATIO
+    facilities_to_keep = facility_nan_rate[
+        facility_nan_rate < MAX_MISSING_RATIO
     ].index
 
     n_before = df[FACILITY_COL].nunique()
@@ -297,12 +292,13 @@ def step7_high_missing_facility_filter(df, df_original):
     return df
 
 
-def step8_high_processed_ratio_filter(df, df_original):
+def step8_high_processed_ratio_filter(df, facility_orig_size):
     """
     8단계: 처리 비율 ≥ 30% 설비 제거 (PNNL Section 2.3 응용)
     근거: PNNL 25% 가이드 + 데이터 분포에서 30~99% 구간이 거의 비어있음
+    facility_orig_size: 원본 데이터 기준 설비별 행 수 (pre-computed)
     """
-    orig_total_points = df_original.groupby(FACILITY_COL).size() * 24
+    orig_total_points = facility_orig_size * 24
     proc_valid_points = df.groupby(FACILITY_COL).apply(
         lambda x: x[HOUR_COLS].notna().sum().sum()
     )
@@ -809,8 +805,14 @@ def run_preprocess():
     # 냉방시즌 컬럼 (냉수용 전용)
     df['냉방시즌'] = df['월'].isin([6, 7, 8, 9])
 
-    # 원본 보존 (7단계, 8단계에서 필요)
-    df_original = df.copy()
+    # 원본 통계 사전 계산 (7/8단계 및 품질 검증에서 필요 — 전체 복사 대신 집계값만 보관)
+    print('  설비별 원본 통계 사전 계산...')
+    facility_nan_rate = df.groupby(FACILITY_COL).apply(
+        lambda x: x[HOUR_COLS].isna().sum().sum() / (len(x) * 24)
+    )
+    facility_orig_size = df.groupby(FACILITY_COL).size()
+    _original_type_counts = {t: int((df['종별'] == t).sum()) for t in ALL_TYPES}
+    gc.collect()
 
     # ═══ Phase 1: 음수 처리 ═══
     print('\n' + '=' * 60)
@@ -837,8 +839,8 @@ def run_preprocess():
     print('=' * 60)
 
     df = step6_min_observation_filter(df)
-    df = step7_high_missing_facility_filter(df, df_original)
-    df, facility_stats = step8_high_processed_ratio_filter(df, df_original)
+    df = step7_high_missing_facility_filter(df, facility_nan_rate)
+    df, facility_stats = step8_high_processed_ratio_filter(df, facility_orig_size)
     gc.collect()
 
     # ═══ Phase 4: 극단값 ═══
@@ -904,9 +906,9 @@ def run_preprocess():
     checks['nan_hourly'] = int(df[HOUR_COLS].isnull().sum().sum())
     checks['neg_total'] = int((df['총사용량'] < 0).sum())
 
-    original_counts = {}
-    for t in ALL_TYPES:
-        original_counts[t] = int((df_original['종별'] == t).sum())
+    # 원본 종별 행 수 (facility_orig_size에서 복원 불가 — 별도 계산 필요)
+    # initial_rows에서 종별 비율로 역산 대신, 사전 보관된 변수 사용
+    original_counts = _original_type_counts
 
     checks['removal_rates'] = {}
     for t in ALL_TYPES:
@@ -961,9 +963,6 @@ def run_preprocess():
     print(f'  파일: {output_path} ({file_size:.1f} MB)')
     print(f'  파라미터: {PROCESSED_DIR}/norm_params.json')
     print(f'  요약: {PROCESSED_DIR}/phase2_summary.json')
-
-    del df_original
-    gc.collect()
 
 
 def run_analyze():

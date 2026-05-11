@@ -7,8 +7,8 @@
 - [x] Phase 0. 데이터 통합 및 기본 정제
 - [x] Phase 1. EDA
 - [x] Phase 2. 정밀 전처리
-- [ ] **Phase 3. Feature Engineering** ← 다음 단계
-- [ ] Phase 4. 정상 패턴 모델링
+- [x] Phase 3. Feature Engineering
+- [ ] **Phase 4. 정상 패턴 모델링** ← 다음 단계
 - [ ] Phase 5. 이상 탐지
 - [ ] Phase 6. 유형 분류 및 결과 해석
 - [ ] Phase 7. 보고서 및 제출물 정리
