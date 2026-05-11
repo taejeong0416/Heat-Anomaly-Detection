@@ -221,10 +221,10 @@ def compute_context_zscore(df):
     df['context_zscore'] = ((df[usage_col] - median) / mad_safe).astype(np.float32)
 
     # 그룹 통계 저장용 (테스트 데이터 적용)
-    stats = df.groupby(group_cols, observed=True)[usage_col].agg(
-        ['median', 'mad']
-    ).reset_index()
-    stats.columns = group_cols + ['median', 'mad']
+    grp = df.groupby(group_cols, observed=True)[usage_col]
+    stats_median = grp.median()
+    stats_mad = grp.apply(lambda x: (x - x.median()).abs().median())
+    stats = pd.DataFrame({'median': stats_median, 'mad': stats_mad}).reset_index()
 
     # JSON 직렬화 가능한 형태로 변환
     group_stats = {}
@@ -287,9 +287,9 @@ def run():
         n_group = mask.sum()
         print(f'  전체: {n_group:,}행')
 
-        # hour_ratio 추출 + 제로 사용일 제외
+        # hour_ratio 추출 + 제로 사용일 제외 (총사용량=0)
         X_all = df.loc[mask, HOUR_RATIO_COLS].values.astype(np.float32)
-        valid_mask = ~np.any(np.isnan(X_all), axis=1)
+        valid_mask = df.loc[mask, '총사용량'].values > 0
         n_valid = valid_mask.sum()
         n_zero = n_group - n_valid
         print(f'  유효: {n_valid:,}행 (제로 사용일 제외: {n_zero:,}행)')
