@@ -252,6 +252,20 @@ def engineer_features(df):
     del hour_data
     gc.collect()
 
+    # ─────────────────────────────────────
+    # NaN → 0 채우기 (총사용량=0인 날 발생분)
+    # ─────────────────────────────────────
+    nan_fill_cols = (
+        ['cv', 'night_ratio', 'day_ratio', 'ma7_ratio', 'ma30_ratio',
+         'autocorr_lag1', 'hour_diff_max', 'hour_diff_std']
+        + [f'hour_ratio_{h}' for h in range(1, 25)]
+    )
+    for col in nan_fill_cols:
+        if col in df.columns:
+            df[col] = df[col].fillna(0)
+
+    log_step(f'NaN→0 채움: {len(nan_fill_cols)}개 피처 (총사용량=0 행)')
+
     print(f'\n[피처 생성 완료] 총 {len(df.columns)}개 컬럼')
     return df
 

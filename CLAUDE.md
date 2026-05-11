@@ -63,7 +63,6 @@
 
 ### 2. 데이터 (`data/processed/`)
 - `data/processed/` 에는 **현재 사용 중인 최신 데이터만** 둔다
-- 과거 버전, 중간 산출물, 로그 등 히스토리 보관용 파일은 `data/processed/archive/`에 저장
 - 데이터는 **parquet** 형식으로 저장
 
 ### 3. 시각화 (`outputs/figures/`)
