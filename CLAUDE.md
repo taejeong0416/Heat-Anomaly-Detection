@@ -8,9 +8,9 @@
 - [x] Phase 1. EDA
 - [x] Phase 2. 정밀 전처리
 - [x] Phase 3. Feature Engineering
-- [ ] **Phase 4. 정상 패턴 모델링** ← 다음 단계
-- [ ] Phase 5. 이상 탐지
-- [ ] Phase 6. 유형 분류 및 결과 해석
+- [ ] **Phase 4. 정상 패턴 모델링** ← 진행 중 (GMM 학습 완료, predict/저장 미완료)
+- [ ] Phase 5. 이상 탐지 (IF + AE + **Matrix Profile** + 통계, 스크립트 완료, 미실행)
+- [ ] Phase 6. 유형 분류 및 결과 해석 (mp_score 패턴이탈형 반영, 스크립트 완료, 미실행)
 - [ ] Phase 7. 보고서 및 제출물 정리
 
 ## 협업 프로세스
@@ -31,6 +31,9 @@
 | `이상유형정의.md` | 이상 유형 분류 체계 (데이터 이상 + 이상사용 유형) |
 | `최종보고서.md` | **누적 진행 보고서** (매 Phase 완료 시 업데이트) |
 | `Data description.txt` | 원본 데이터 설명서 |
+| `scripts/phase4_normal_pattern.py` | Phase 4 GMM 정상 패턴 모델링 코드 |
+| `scripts/phase5_anomaly_detection.py` | Phase 5 이상 탐지 코드 (IF + AE + 통계) |
+| `scripts/phase6_classification.py` | Phase 6 유형 분류 및 SHAP 해석 코드 |
 
 ## 데이터 기본 정보
 

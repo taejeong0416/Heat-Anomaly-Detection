@@ -206,19 +206,23 @@ def compute_context_zscore(df):
     group_cols = ['종별', '지사', '월', '요일']
     usage_col = '총사용량'
 
-    # 그룹별 median, MAD 계산
+    # 그룹별 median, MAD 계산 (메모리 절약: assign() 대신 inplace)
     grouped = df.groupby(group_cols, observed=True)[usage_col]
     median = grouped.transform('median')
     # MAD = median(|x - median(x)|)
     abs_dev = (df[usage_col] - median).abs()
-    mad = df.assign(_abs_dev=abs_dev).groupby(
-        group_cols, observed=True
-    )['_abs_dev'].transform('median')
-    df.drop(columns='_abs_dev', inplace=True, errors='ignore')
+    df['_abs_dev'] = abs_dev
+    del abs_dev
+    gc.collect()
+    mad = df.groupby(group_cols, observed=True)['_abs_dev'].transform('median')
+    df.drop(columns='_abs_dev', inplace=True)
+    gc.collect()
 
     # z-score = (x - median) / MAD, MAD=0이면 NaN
     mad_safe = mad.replace(0, np.nan)
     df['context_zscore'] = ((df[usage_col] - median) / mad_safe).astype(np.float32)
+    del median, mad, mad_safe
+    gc.collect()
 
     # 그룹 통계 저장용 (테스트 데이터 적용)
     grp = df.groupby(group_cols, observed=True)[usage_col]

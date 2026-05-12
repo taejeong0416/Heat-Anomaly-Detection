@@ -1,12 +1,13 @@
 """
 Phase 5. 이상 탐지
 Phase 4의 정상 패턴 모델 출력(gmm_log_likelihood, context_zscore, cluster_id)에
-Isolation Forest + Autoencoder + 통계 기반 보조 탐지를 결합하여
+Isolation Forest + Autoencoder + Matrix Profile + 통계 기반 보조 탐지를 결합하여
 설비-일 단위 anomaly score와 이상 여부 라벨을 산출한다.
 
 학술/도메인 근거:
   Liu et al. (2008)  — Isolation Forest
   Hinton & Salakhutdinov (2006), Sakurada & Yairi (2014) — Autoencoder 이상 탐지
+  Yeh et al. (2016) — Matrix Profile (시계열 자기 참조 이상 탐지)
   PNNL-24331 (2015) — z-score / IQR 기반 보조 필터
   도메인조사.md §5 — 이상 7유형 (Phase 5-1)
 
@@ -33,6 +34,14 @@ import pickle
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import RobustScaler
 from sklearn.metrics import f1_score, precision_score, recall_score
+
+# Matrix Profile
+try:
+    import stumpy
+except ImportError:
+    raise ImportError(
+        'Matrix Profile 계산에 stumpy 패키지 필요: pip install stumpy'
+    )
 
 # Autoencoder는 PyTorch 사용 (sklearn에는 적합한 AE 구현 없음)
 import torch
@@ -80,6 +89,8 @@ AE_SAMPLE_SIZE = 300_000   # AE 학습용 샘플 상한 (종별별)
 AE_VAL_RATIO = 0.1
 
 # IF 입력 피처 (분석플랜 5-2)
+# gmm_log_likelihood 제거: Phase 4 모델 출력을 IF 입력에 넣으면 정보 누수(leakage)
+# context_zscore는 그룹 통계 기반이므로 보조 피처로 유지
 IF_FEATURES = (
     HOUR_RATIO_COLS
     + [
@@ -89,9 +100,16 @@ IF_FEATURES = (
         'ma7_ratio', 'ma30_ratio',
         'autocorr_lag1', 'hour_diff_max', 'hour_diff_std',
         'zero_count',
-        'gmm_log_likelihood', 'context_zscore',
+        'context_zscore',
     ]
 )
+
+# Matrix Profile 설정 (stumpy 기반 시계열 자기 참조 이상 탐지)
+# 설비별 일별 총사용량 시계열 → window=7(주간 패턴)로 discord 탐지
+# GMM/AE는 "다른 설비 대비" 비교, MP는 "자기 과거 대비" 비교 → 관점 차별화
+MP_WINDOW = 7          # 7일 = 주간 패턴 (요일 주기 포착)
+MP_MIN_DAYS = 14       # 최소 2주 이상 데이터 필요
+MP_TOP_PCT_GRID = [0.01, 0.02, 0.03, 0.05]
 
 RANDOM_STATE = 42
 log = []
@@ -110,6 +128,13 @@ def weak_label_from_gmm(loglik, quantile=WEAK_LABEL_QUANTILE):
     """
     GMM log-likelihood 하위 q%를 약 라벨(이상=1)로 정의.
     NaN(GMM 미적용 행)은 0으로 둔다.
+
+    주의(순환 논리 한계):
+      이 약 라벨은 IF/AE 모델 '학습'이 아닌 '임계 선정'에만 사용.
+      IF/AE는 비지도 학습이며, 약 라벨은 여러 후보 임계 중
+      GMM 정상 패턴과 가장 일치하는 것을 고르는 역할.
+      라벨 없는 환경에서의 실용적 접근이나, 최종 검증은
+      Phase 6 수동 검토(manual_review_samples)로 보완.
     """
     valid = np.isfinite(loglik)
     y = np.zeros(len(loglik), dtype=np.int8)
@@ -371,8 +396,8 @@ def stat_anomaly_flags(df, weak_label):
              f"(|z|≥{thr_z:.2f}, F1={best_z['f1']:.3f}) → "
              f"이상 {int(stat_zscore_flag.sum()):,}행")
 
-    # ── 종별·월 IQR (Tukey 1.5×IQR 표준 룰) ──
-    grp = df.groupby(['종별', '월'], observed=True)['총사용량']
+    # ── 종별·지사·월 IQR (Tukey 1.5×IQR 표준 룰) ──
+    grp = df.groupby(['종별', '지사', '월'], observed=True)['총사용량']
     q1 = grp.transform(lambda x: x.quantile(0.25))
     q3 = grp.transform(lambda x: x.quantile(0.75))
     iqr = q3 - q1
@@ -389,7 +414,82 @@ def stat_anomaly_flags(df, weak_label):
 
 
 # ============================================================
-# 4. 시각화
+# 4. Matrix Profile (설비별 시계열 자기 참조 이상 탐지)
+# ============================================================
+
+def compute_matrix_profile(df):
+    """
+    설비별 일별 총사용량 시계열에 Matrix Profile (stumpy) 적용.
+    window=7 (주간 패턴): "이 설비의 이번 주 사용 궤적이 과거와 얼마나 다른가"를 측정.
+
+    기존 방법과의 차별점:
+      GMM         → 같은 종별의 다른 설비들 대비 (횡단면, 인구 참조)
+      Context Z   → 같은 조건 동료 건물 대비 (횡단면, 동료 참조)
+      AE          → 전체 정상 패턴 대비 복원 오차 (패턴 형태)
+      **MP**      → **자기 자신의 과거** 대비 (시계열, 자기 참조)
+
+    Returns: np.float32 array (length=len(df)), 값이 클수록 이질적 구간.
+    """
+    print('\n[Matrix Profile 계산]')
+    mp_scores = np.full(len(df), np.nan, dtype=np.float32)
+
+    t0 = time.time()
+    n_fac = df[FACILITY_COL].nunique()
+    processed = 0
+    skipped = 0
+
+    for fac, grp in df.groupby(FACILITY_COL):
+        grp_sorted = grp.sort_values(DATE_COL)
+        ts = grp_sorted['총사용량'].values.astype(np.float64)
+        n_days = len(ts)
+
+        if n_days < MP_MIN_DAYS:
+            skipped += 1
+            continue
+
+        # NaN 처리: 중위수로 채움 (MP 계산용, 결과에선 원래 NaN 위치 복원)
+        nan_mask = ~np.isfinite(ts)
+        if nan_mask.all():
+            skipped += 1
+            continue
+        ts_clean = ts.copy()
+        if nan_mask.any():
+            ts_clean[nan_mask] = np.nanmedian(ts)
+
+        # 상수 시계열 (std≈0) → stumpy 정규화 실패 방지
+        if np.std(ts_clean) < 1e-10:
+            skipped += 1
+            continue
+
+        # stumpy Matrix Profile (window=7, 주간 패턴)
+        result = stumpy.stump(ts_clean, m=MP_WINDOW)
+        mp_vals = result[:, 0].astype(np.float32)
+
+        # MP 길이 = n_days - MP_WINDOW + 1
+        # 각 MP[i]를 i번째 날에 할당 (7일 구간의 시작일)
+        day_scores = np.full(n_days, np.nan, dtype=np.float32)
+        day_scores[:len(mp_vals)] = mp_vals
+        # 원래 NaN이었던 날은 다시 NaN
+        day_scores[nan_mask] = np.nan
+
+        mp_scores[grp_sorted.index] = day_scores
+        processed += 1
+
+        if processed % 2000 == 0:
+            elapsed = time.time() - t0
+            print(f'    {processed}/{n_fac} 설비 처리 ({elapsed:.1f}s)')
+
+    elapsed = time.time() - t0
+    valid_count = int(np.isfinite(mp_scores).sum())
+    print(f'  완료: {processed}설비 처리, {skipped}설비 스킵 ({elapsed:.1f}s)')
+    print(f'  유효 mp_score: {valid_count:,}행 ({valid_count/len(df)*100:.1f}%)')
+    log_step(f'Matrix Profile 완료: {processed}설비, 유효 {valid_count:,}행 ({elapsed:.1f}s)')
+
+    return mp_scores
+
+
+# ============================================================
+# 5. 시각화
 # ============================================================
 
 def plot_score_dist(scores, title, save_path, thr=None):
@@ -421,19 +521,23 @@ def plot_ensemble_overlap(df, save_path):
     plt.rcParams['font.family'] = 'Malgun Gothic'
     plt.rcParams['axes.unicode_minus'] = False
 
+    vote = (df['if_flag'].astype(int)
+            + df['ae_flag'].astype(int)
+            + df['mp_flag'].astype(int))
     cnts = {
-        'IF only': int(((df['if_flag'] == 1) & (df['ae_flag'] == 0)).sum()),
-        'AE only': int(((df['if_flag'] == 0) & (df['ae_flag'] == 1)).sum()),
-        'Both (고신뢰)': int(((df['if_flag'] == 1) & (df['ae_flag'] == 1)).sum()),
-        'None': int(((df['if_flag'] == 0) & (df['ae_flag'] == 0)).sum()),
+        '0표 (정상)': int((vote == 0).sum()),
+        '1표 (저신뢰)': int((vote == 1).sum()),
+        '2표 (고신뢰)': int((vote == 2).sum()),
+        '3표 (최고신뢰)': int((vote == 3).sum()),
     }
     fig, ax = plt.subplots(figsize=(7, 4))
     keys = list(cnts.keys())
     vals = [cnts[k] for k in keys]
-    ax.bar(keys, vals, color=['#42A5F5', '#66BB6A', '#EF5350', '#BDBDBD'])
+    colors = ['#BDBDBD', '#42A5F5', '#EF5350', '#B71C1C']
+    ax.bar(keys, vals, color=colors)
     for i, v in enumerate(vals):
         ax.text(i, v, f'{v:,}', ha='center', va='bottom', fontsize=9)
-    ax.set_title('IF / AE 앙상블 분포')
+    ax.set_title('IF / AE / MP 앙상블 투표 분포')
     ax.set_ylabel('rows')
     ax.set_yscale('log')
     ax.grid(True, alpha=0.3, axis='y')
@@ -450,7 +554,7 @@ def run():
     t_start = time.time()
 
     print('=' * 60)
-    print('Phase 5. 이상 탐지 (Isolation Forest + Autoencoder + 통계)')
+    print('Phase 5. 이상 탐지 (IF + AE + Matrix Profile + 통계)')
     print('=' * 60)
 
     os.makedirs(FIG_DIR, exist_ok=True)
@@ -469,6 +573,15 @@ def run():
     df[DATE_COL] = pd.to_datetime(df[DATE_COL])
     print(f'  입력: {len(df):,}행, {len(df.columns)}개 컬럼')
 
+    # ── 입력 데이터 검증 ──
+    required_cols = IF_FEATURES + ['gmm_log_likelihood', 'cluster_id']
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise RuntimeError(
+            f'Phase 4 산출물 컬럼 누락: {missing}. '
+            f'Phase 4 (scripts/phase4_normal_pattern.py) 실행 후 재시도.'
+        )
+
     # 결측 보호: IF 입력에서 NaN 행 인덱싱 위해 마스크 보관
     missing_required = df[IF_FEATURES].isna().any(axis=1)
     print(f'  IF 입력 NaN 행: {int(missing_required.sum()):,}'
@@ -479,6 +592,8 @@ def run():
     df['if_flag'] = np.int8(0)
     df['ae_score'] = np.float32(np.nan)
     df['ae_flag'] = np.int8(0)
+    df['mp_score'] = np.float32(np.nan)
+    df['mp_flag'] = np.int8(0)
 
     # ── 종별별 Isolation Forest + Autoencoder ──
     print('\n[종별별 IF + AE 학습 + 그리드 탐색]')
@@ -604,26 +719,81 @@ def run():
         del X_if_raw, X_if, if_score, if_flag_local
         gc.collect()
 
-    # ── 통계 기반 보조 탐지 (전체 데이터 weak label로 그리드 탐색) ──
+    # ── Matrix Profile (설비별 시계열 자기 참조 이상 탐지) ──
+    df['mp_score'] = compute_matrix_profile(df)
+
+    # 종별별 MP 그리드 탐색 (weak label 기반 F1 최대화)
+    print('\n[종별별 MP 그리드 탐색]')
     full_weak = weak_label_from_gmm(
         df['gmm_log_likelihood'].values, WEAK_LABEL_QUANTILE
     )
+    for type_name in TYPES:
+        mask = df['종별'] == type_name
+        mp_vals = df.loc[mask, 'mp_score'].values.astype(np.float32)
+        valid_mp = np.isfinite(mp_vals)
+
+        if valid_mp.sum() < 1000:
+            log_step(f'{type_name}: MP SKIP (유효 {int(valid_mp.sum())}행)')
+            continue
+
+        loglik_grp = df.loc[mask, 'gmm_log_likelihood'].values
+        weak_y = weak_label_from_gmm(loglik_grp, WEAK_LABEL_QUANTILE)
+
+        mp_best, mp_grid = grid_select_by_f1(
+            mp_vals, weak_y, MP_TOP_PCT_GRID
+        )
+        thr_mp = mp_best['threshold']
+        mp_flag_local = np.zeros(len(mp_vals), dtype=np.int8)
+        mp_flag_local[valid_mp & (mp_vals >= thr_mp)] = 1
+
+        idx = df.index[mask]
+        df.loc[idx, 'mp_flag'] = mp_flag_local
+
+        n_mp_anom = int(mp_flag_local.sum())
+        n_mp_total = int(mask.sum())
+        print(f"  {type_name}: top_pct={mp_best['top_pct']:.3f} "
+              f"(F1={mp_best['f1']:.3f}), "
+              f"이상 {n_mp_anom:,}행 ({n_mp_anom/n_mp_total*100:.2f}%)")
+
+        if type_name in grid_records:
+            grid_records[type_name]['mp_grid'] = mp_grid
+            grid_records[type_name]['mp_best'] = mp_best
+
+        # summary_rows 업데이트
+        for row in summary_rows:
+            if row['type'] == type_name:
+                row['mp_top_pct'] = mp_best['top_pct']
+                row['mp_f1'] = mp_best['f1']
+                row['mp_anomalies'] = n_mp_anom
+                row['mp_anomaly_pct'] = n_mp_anom / n_mp_total * 100
+
+        plot_score_dist(
+            mp_vals[valid_mp],
+            f'{type_name} | Matrix Profile score',
+            os.path.join(FIG_DIR, f'phase05_mp_score_{type_name}.png'),
+            thr=thr_mp,
+        )
+
+    # ── 통계 기반 보조 탐지 (전체 데이터 weak label로 그리드 탐색) ──
     df, stat_grid = stat_anomaly_flags(df, full_weak)
 
-    # ── 앙상블: 둘 다 이상 = 고신뢰 ──
-    print('\n[앙상블]')
-    if_flag = df['if_flag'].astype(np.int8).values
-    ae_flag = df['ae_flag'].astype(np.int8).values
+    # ── 앙상블: 3개(IF+AE+MP) 중 2개 이상 = 고신뢰 ──
+    print('\n[앙상블 (IF + AE + MP 다수결)]')
+    if_flag = df['if_flag'].astype(int).values
+    ae_flag = df['ae_flag'].astype(int).values
+    mp_flag = df['mp_flag'].astype(int).values
     stat_flag = (
-        (df['stat_zscore_flag'].astype(np.int8).values == 1)
-        | (df['stat_iqr_flag'].astype(np.int8).values == 1)
-    ).astype(np.int8)
+        (df['stat_zscore_flag'].astype(int).values == 1)
+        | (df['stat_iqr_flag'].astype(int).values == 1)
+    ).astype(int)
 
-    # 신뢰도: 둘 다=high, 하나만=low, 통계만=stat
+    vote = if_flag + ae_flag + mp_flag  # 0~3
+
+    # 신뢰도: 2+표=high, 1표=low, 0표+통계만=stat_only
     confidence = np.full(len(df), 'normal', dtype=object)
-    confidence[(if_flag == 1) & (ae_flag == 1)] = 'high'
-    confidence[((if_flag == 1) ^ (ae_flag == 1))] = 'low'
-    only_stat = (if_flag == 0) & (ae_flag == 0) & (stat_flag == 1)
+    confidence[vote >= 2] = 'high'
+    confidence[vote == 1] = 'low'
+    only_stat = (vote == 0) & (stat_flag == 1)
     confidence[only_stat] = 'stat_only'
 
     df['anomaly_confidence'] = pd.Categorical(
@@ -638,7 +808,8 @@ def run():
         v = int(counts.get(k, 0))
         print(f'  {k}: {v:,}행 ({v/len(df)*100:.2f}%)')
     log_step(
-        f"앙상블 완료: high={int(counts.get('high',0)):,}, "
+        f"앙상블 완료 (IF+AE+MP 다수결): "
+        f"high={int(counts.get('high',0)):,}, "
         f"low={int(counts.get('low',0)):,}, "
         f"stat_only={int(counts.get('stat_only',0)):,}"
     )
@@ -664,6 +835,7 @@ def run():
         'gmm_log_likelihood', 'context_zscore',
         'if_score', 'if_flag',
         'ae_score', 'ae_flag',
+        'mp_score', 'mp_flag',
         'stat_zscore_flag', 'stat_iqr_flag',
         'anomaly_confidence', 'is_anomaly',
     ]
@@ -689,6 +861,7 @@ def run():
         'new_columns': [
             'if_score', 'if_flag',
             'ae_score', 'ae_flag',
+            'mp_score', 'mp_flag',
             'stat_zscore_flag', 'stat_iqr_flag',
             'anomaly_confidence', 'is_anomaly',
         ],
@@ -710,6 +883,7 @@ def run():
         'grids': {
             'if_contamination_grid': IF_CONTAMINATION_GRID,
             'ae_top_pct_grid': AE_TOP_PCT_GRID,
+            'mp_top_pct_grid': MP_TOP_PCT_GRID,
             'stat_top_pct_grid': STAT_TOP_PCT_GRID,
         },
         'fixed_params': {
@@ -717,6 +891,8 @@ def run():
             'if_max_samples': IF_MAX_SAMPLES,
             'ae_hidden': AE_HIDDEN,
             'ae_epochs': AE_EPOCHS,
+            'mp_window': MP_WINDOW,
+            'mp_min_days': MP_MIN_DAYS,
         },
         'per_type': summary_rows,
         'per_type_grids': grid_records,

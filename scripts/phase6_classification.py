@@ -106,39 +106,43 @@ def classify_types(df_anom, df_all):
     """
     print('\n[유형 규칙 적용]')
 
-    # ── (그룹 통계: 종별·월 night_ratio 평균/표준편차) ──
+    # ── (그룹 통계: 종별·월 night_ratio 평균/표준편차, 정상 데이터만) ──
+    normal_mask = df_all['is_anomaly'] == 0
     nr_stats = (
-        df_all.groupby(['종별', '월'], observed=True)['night_ratio']
+        df_all[normal_mask].groupby(['종별', '월'], observed=True)['night_ratio']
         .agg(['mean', 'std']).reset_index()
         .rename(columns={'mean': 'nr_mean', 'std': 'nr_std'})
     )
     df_anom = df_anom.merge(nr_stats, on=['종별', '월'], how='left')
 
-    # ── (그룹 통계: 종별·활성시즌 baseload 95%분위) ──
+    # ── (그룹 통계: 종별·활성시즌 baseload 95%분위, 정상 데이터만) ──
     bl_q = (
-        df_all.groupby(['종별', '활성시즌'], observed=True)['baseload']
+        df_all[normal_mask].groupby(['종별', '활성시즌'], observed=True)['baseload']
         .quantile(BASELOAD_QTILE).reset_index()
         .rename(columns={'baseload': 'bl_thr'})
     )
     df_anom = df_anom.merge(bl_q, on=['종별', '활성시즌'], how='left')
 
-    # ── (그룹 통계: 종별·활성시즌 사용량 95%분위 — 계절역행용) ──
+    # ── (그룹 통계: 종별·활성시즌 사용량 95%분위 — 계절역행용, 정상 데이터만) ──
     use_q = (
-        df_all.groupby(['종별', '활성시즌'], observed=True)['총사용량']
+        df_all[normal_mask].groupby(['종별', '활성시즌'], observed=True)['총사용량']
         .quantile(SEASON_REV_QTILE).reset_index()
         .rename(columns={'총사용량': 'use_q95'})
     )
     df_anom = df_anom.merge(use_q, on=['종별', '활성시즌'], how='left')
 
-    # ── (이상 샘플 내부 분위 — 급증/패턴이탈) ──
-    q_ma7 = df_anom['ma7_ratio'].quantile(SURGE_MA7_QTILE)
-    q_z = df_anom['context_zscore'].abs().quantile(SURGE_Z_QTILE)
-    q_ll = df_anom['gmm_log_likelihood'].quantile(PATTERN_LL_QTILE)
-    q_ae = df_anom['ae_score'].quantile(PATTERN_AE_QTILE)
-    q_long_ma7 = df_anom['ma7_ratio'].quantile(LONG_MA7_QTILE)
+    # ── 분위 기준: 전체 데이터 기반 (이상 샘플 내부가 아님) ──
+    # 이상 샘플 내부 기준은 샘플 크기에 따라 절대 기준이 변동하므로
+    # 전체 데이터 분포 기준으로 임계를 설정하여 재현성 확보
+    q_ma7 = df_all['ma7_ratio'].quantile(SURGE_MA7_QTILE)
+    q_z = df_all['context_zscore'].abs().quantile(SURGE_Z_QTILE)
+    q_ll = df_all['gmm_log_likelihood'].quantile(PATTERN_LL_QTILE)
+    q_ae = df_all['ae_score'].quantile(PATTERN_AE_QTILE)
+    q_mp = df_all['mp_score'].quantile(PATTERN_AE_QTILE)
+    q_long_ma7 = df_all['ma7_ratio'].quantile(LONG_MA7_QTILE)
 
     log_step(f'임계: ma7≥{q_ma7:.3f}, |z|≥{q_z:.2f}, '
-             f'logLL≤{q_ll:.2f}, ae≥{q_ae:.4f}')
+             f'logLL≤{q_ll:.2f}, ae≥{q_ae:.4f}, mp≥{q_mp:.4f}')
 
     # ── 7개 유형 라벨 ──
     df_anom['type_급증형'] = (
@@ -152,8 +156,14 @@ def classify_types(df_anom, df_all):
     df_anom['type_패턴이탈형'] = (
         (df_anom['gmm_log_likelihood'] <= q_ll)
         | (df_anom['ae_score'] >= q_ae)
+        | (df_anom['mp_score'] >= q_mp)
     )
 
+    # 주의: zero_count는 "하루 24시간 중 0인 시간 수"이며,
+    # "연속 제로일 수"가 아님. 24시간 전부 0 = 미사용일로 간주.
+    # zero_count >= LONG_ZERO_DAYS(7)는 곧 "24시간 중 7시간 이상 0"이므로
+    # 실질적으로 저사용/미사용일을 포착. 엄밀한 "연속 N일 미사용"은
+    # 설비별 시계열 롤링이 필요하므로 향후 개선 과제.
     df_anom['type_장기미사용후급증형'] = (
         (df_anom['활성시즌'] == True)
         & (df_anom['zero_count'] >= LONG_ZERO_DAYS)
@@ -165,6 +175,18 @@ def classify_types(df_anom, df_all):
         & (df_anom['총사용량'] >= df_anom['use_q95'])
     )
 
+    # ── 주말이상형: 업무용/공공용 주말 사용량이 정상 평일 중위수 수준 이상 ──
+    weekday_median = (
+        df_all[normal_mask
+               & df_all['종별'].isin(['업무용', '공공용'])
+               & (~df_all['is_weekend'].astype(bool))
+               & (~df_all['is_holiday'].astype(bool))]
+        .groupby(['종별', '월'], observed=True)['총사용량']
+        .median().reset_index()
+        .rename(columns={'총사용량': 'weekday_med'})
+    )
+    df_anom = df_anom.merge(weekday_median, on=['종별', '월'], how='left')
+
     is_office_pub = df_anom['종별'].isin(['업무용', '공공용'])
     is_off = (
         (df_anom['is_weekend'].astype(bool))
@@ -172,7 +194,7 @@ def classify_types(df_anom, df_all):
     )
     df_anom['type_주말이상형'] = (
         is_office_pub & is_off
-        & (df_anom['총사용량'] >= df_anom['use_q95'] * WEEKEND_RATIO)
+        & (df_anom['총사용량'] >= df_anom['weekday_med'] * WEEKEND_RATIO)
     )
 
     df_anom['type_기저유량이상형'] = df_anom['baseload'] >= df_anom['bl_thr']
@@ -208,13 +230,14 @@ def classify_types(df_anom, df_all):
 
     df_anom['secondary_types'] = df_anom.apply(pick_secondary, axis=1)
 
-    # ── 심각도 (0~1로 정규화된 IF score) ──
-    if_min = df_anom['if_score'].min()
-    if_max = df_anom['if_score'].max()
+    # ── 심각도 (0~1로 정규화된 IF score, 전체 데이터 기준) ──
+    if_valid = df_all['if_score'].dropna()
+    if_min = if_valid.min()
+    if_max = if_valid.max()
     if if_max > if_min:
         df_anom['severity'] = (
             (df_anom['if_score'] - if_min) / (if_max - if_min)
-        ).astype(np.float32)
+        ).clip(0, 1).astype(np.float32)
     else:
         df_anom['severity'] = np.float32(0.5)
 
@@ -277,8 +300,16 @@ def run_shap(df_all, type_dist_idx):
             explainer = shap.TreeExplainer(model)
             shap_vals = explainer.shap_values(X)
         except Exception as e:
-            print(f'    TreeExplainer 실패 ({e}), KernelExplainer 미시도')
-            continue
+            print(f'    TreeExplainer 실패 ({e}), PermutationExplainer 시도')
+            try:
+                explainer = shap.PermutationExplainer(
+                    model.decision_function,
+                    X[:min(100, len(X))],
+                )
+                shap_vals = explainer(X).values
+            except Exception as e2:
+                print(f'    PermutationExplainer도 실패 ({e2}) → SHAP 스킵')
+                continue
 
         # (a) summary bar
         fig = plt.figure(figsize=(10, 6))
@@ -493,6 +524,21 @@ def run():
     gc.collect()
 
     df_all[DATE_COL] = pd.to_datetime(df_all[DATE_COL])
+
+    # ── 입력 데이터 검증 ──
+    required = [
+        'is_anomaly', 'if_score', 'ae_score', 'mp_score',
+        'gmm_log_likelihood', 'context_zscore',
+        'is_weekend', 'is_holiday', '난방시즌', '냉방시즌',
+        'night_ratio', 'baseload', 'ma7_ratio', 'zero_count',
+    ]
+    missing = [c for c in required if c not in df_all.columns]
+    if missing:
+        raise RuntimeError(
+            f'Phase 5 산출물 컬럼 누락: {missing}. '
+            f'Phase 5 (scripts/phase5_anomaly_detection.py) 실행 후 재시도.'
+        )
+
     df_all = add_active_season(df_all)
     print(f'  전체: {len(df_all):,}행, {len(df_all.columns)}개 컬럼')
 
@@ -544,7 +590,8 @@ def run():
         review_cols = [
             FACILITY_COL, DATE_COL, '종별', '지사', '총사용량',
             'primary_type', 'secondary_types', 'severity',
-            'if_score', 'ae_score', 'gmm_log_likelihood', 'context_zscore',
+            'if_score', 'ae_score', 'mp_score',
+            'gmm_log_likelihood', 'context_zscore',
         ]
         review_cols = [c for c in review_cols if c in review_df.columns]
         review_df[review_cols].to_csv(
@@ -561,6 +608,7 @@ def run():
         '난방시즌', '냉방시즌', '활성시즌',
         '총사용량',
         'if_score', 'if_flag', 'ae_score', 'ae_flag',
+        'mp_score', 'mp_flag',
         'gmm_log_likelihood', 'context_zscore',
         'stat_zscore_flag', 'stat_iqr_flag',
         'anomaly_confidence', 'is_anomaly',
