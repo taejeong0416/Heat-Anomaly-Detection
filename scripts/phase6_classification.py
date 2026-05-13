@@ -52,7 +52,7 @@ IF_FEATURES = (
         'ma7_ratio', 'ma30_ratio',
         'autocorr_lag1', 'hour_diff_max', 'hour_diff_std',
         'zero_count',
-        'gmm_log_likelihood', 'context_zscore',
+        'context_zscore',
     ]
 )
 
