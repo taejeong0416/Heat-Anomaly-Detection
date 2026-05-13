@@ -1,0 +1,77 @@
+{
+  "eval_rows": 9200,
+  "true_normal": 4000,
+  "true_anomaly": 5200,
+  "metrics": [
+    {
+      "algorithm": "Ours",
+      "precision": 0.9852027226990234,
+      "recall": 0.6401923076923077,
+      "f1": 0.776081128336636
+    },
+    {
+      "algorithm": "Baseline_전년대비±30%",
+      "precision": 0.6887553376561759,
+      "recall": 0.8375,
+      "f1": 0.7558795452573115
+    }
+  ],
+  "type_recall": [
+    {
+      "type": "급증형",
+      "n": 800,
+      "ours_recall": 0.645,
+      "baseline_recall": 0.94125
+    },
+    {
+      "type": "야간이상형",
+      "n": 800,
+      "ours_recall": 0.9675,
+      "baseline_recall": 0.9675
+    },
+    {
+      "type": "패턴이탈형",
+      "n": 800,
+      "ours_recall": 0.21625,
+      "baseline_recall": 0.485
+    },
+    {
+      "type": "장기미사용후급증형",
+      "n": 800,
+      "ours_recall": 0.78125,
+      "baseline_recall": 0.71
+    },
+    {
+      "type": "계절역행형",
+      "n": 800,
+      "ours_recall": 0.74625,
+      "baseline_recall": 0.92875
+    },
+    {
+      "type": "주말이상형",
+      "n": 400,
+      "ours_recall": 0.305,
+      "baseline_recall": 0.9
+    },
+    {
+      "type": "기저유량이상형",
+      "n": 800,
+      "ours_recall": 0.6525,
+      "baseline_recall": 0.96125
+    }
+  ],
+  "config": {
+    "n_per_type": 200,
+    "sample_normal": 1000,
+    "if_top_pct": 0.02,
+    "ae_top_pct": 0.03,
+    "baseline_threshold": 0.3,
+    "ensemble": "IF OR AE (recall 우선)"
+  },
+  "limitations": [
+    "합성 이상은 실제 이상의 근사이며 도메인 케이스를 완전히 커버하지 않음",
+    "ma7_ratio / autocorr_lag1 / mp_score 등 history 의존 피처는 원본값 유지",
+    "임계는 학습 단계 contamination(0.02), AE top_pct(0.03) 가정",
+    "학습 모델이 동일 데이터(2021~2025)를 이미 보았으므로 in-sample 평가 한계 존재"
+  ]
+}

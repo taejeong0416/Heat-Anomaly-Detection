@@ -56,17 +56,59 @@ IF_FEATURES = (
     ]
 )
 
-# 유형 판정 임계 (이상 샘플 내부 상대 기준)
+# ============================================================
+# 유형 판정 임계
+# (2026-05-13 갱신: Phase 4 클러스터 검토 후 4-agent review 결과 반영)
+# ============================================================
 SURGE_MA7_QTILE = 0.90         # 급증형: ma7_ratio 상위 10%
 SURGE_Z_QTILE = 0.90           # 급증형: context_zscore 상위 10%
-NIGHT_SIGMA = 2.0              # 야간: 종별·월 평균 + 2σ
-PATTERN_LL_QTILE = 0.10        # 패턴이탈: gmm_log_likelihood 하위 10%
-PATTERN_AE_QTILE = 0.90        # 패턴이탈: ae_score 상위 10%
-LONG_ZERO_DAYS = 7             # 장기미사용 임계 zero_count
-LONG_MA7_QTILE = 0.80          # 장기미사용 후 급증: ma7_ratio 상위 20%
-SEASON_REV_QTILE = 0.95        # 계절역행: 비활성시즌 사용량 상위 5%
+
+# (G) 야간이상형 종별별 σ 차등:
+#   주택용은 새벽 가동(C0 클러스터 34.9%)이 정상이라 +3σ로 엄격화,
+#   나머지는 +2σ 유지. 종별별 정상 평균/표준편차는 df_all에서 산출.
+NIGHT_SIGMA_BY_TYPE = {
+    '주택용': 3.0,             # +3σ (정상 새벽 가동 회피)
+    '업무용': 2.0,
+    '공공용': 2.0,
+    '냉수용': 2.0,
+}
+NIGHT_APPLICABLE_TYPES = {'주택용', '업무용', '공공용', '냉수용'}  # (D)+(G) 전 종별 적용
+
+# (A)+(H) 패턴이탈형: AND 결합 유지, 임계는 1% → 5%로 완화 (fallback 적정 흡수)
+PATTERN_LL_QTILE = 0.05        # gmm_log_likelihood 하위 5%
+PATTERN_AE_QTILE = 0.95        # ae_score 상위 5%
+PATTERN_MP_QTILE = 0.95        # mp_score 상위 5%
+
+# (B) 장기미사용후급증형: 설비별 직전 7일 연속 무사용 후 다음날 급증
+LONG_NO_USE_DAYS = 7
+LONG_MA7_QTILE = 0.80          # ma7_ratio 상위 20%
+
+# (C) 계절역행형 종별별 임계: 주택용은 99% (엄격), 나머지 95%
+SEASON_REV_QTILE_BY_TYPE = {
+    '주택용': 0.99,
+    '업무용': 0.95,
+    '공공용': 0.95,
+    '냉수용': 0.95,
+}
+
 WEEKEND_RATIO = 0.8            # 주말·공휴일이 평일 수준 80% 이상
 BASELOAD_QTILE = 0.95          # 기저유량 상위 5%
+
+# (F) 신규 유형: 연속가동형(상시가동형)
+#   데이터 근거: Phase 4 주택용 C4 평탄 클러스터(41.6%)가 이미 정상으로 학습됨.
+#                그보다 더 평탄한 케이스는 분명한 이상 (분포 tail)
+#   도메인 근거: 보일러 상시 가동, HVAC 24시간 작동, 배관 누수 지속 유량
+#   규칙: hourly_std 종별·활성시즌 정상 5% 이하 AND baseload 80% 이상
+FLAT_STD_QTILE = 0.05          # hourly_std 종별·활성시즌 정상 하위 5%
+FLAT_BASELOAD_QTILE = 0.80     # baseload 종별·활성시즌 정상 상위 20%
+
+# (I) 신규 유형: 간헐사용형(비정형 사용 패턴)
+#   데이터 근거: Phase 6b 미분류 검토 — cv z=+2.01, hourly_std z=+1.09,
+#                ae_score z=+3.11 → 정상 형태에서 들쭉날쭉 벗어남
+#   도메인 근거: 열량계 간헐 결함, 비정형 거주 패턴, 급수 결함
+#   규칙: cv 종별·활성시즌 정상 상위 5% AND hourly_std 상위 5%
+INTERMITTENT_CV_QTILE = 0.95
+INTERMITTENT_STD_QTILE = 0.95
 
 REPRESENTATIVE_N = 5           # 유형별 대표 사례 수
 SHAP_SAMPLE = 1000             # SHAP 계산 샘플 (종별별)
@@ -83,6 +125,36 @@ def log_step(msg):
 # ============================================================
 # 1. 유형 분류 규칙
 # ============================================================
+
+def compute_long_no_use_surge(df_anom, df_all, q_long_ma7):
+    """
+    (B) 장기미사용후급증형 재정의:
+      설비별 시계열을 일자 정렬해 "직전 7일 연속 총사용량=0" 이후
+      당일 ma7_ratio가 q_long_ma7 이상이면 True.
+    df_all에서 설비별 롤링 계산 후 df_anom 인덱스로 lookup.
+    """
+    # 설비-날짜 정렬 후 직전 7일 0 여부 계산
+    tmp = df_all[[FACILITY_COL, DATE_COL, '총사용량']].copy()
+    tmp = tmp.sort_values([FACILITY_COL, DATE_COL])
+    # 직전 7일 모두 0인지: 이전 7개 값의 합 == 0
+    tmp['_rolling_sum_prev7'] = (
+        tmp.groupby(FACILITY_COL)['총사용량']
+        .transform(lambda s: s.shift(1).rolling(7, min_periods=7).sum())
+    )
+    tmp['_long_no_use'] = (tmp['_rolling_sum_prev7'] == 0)
+    # df_anom의 (설치, 날짜) 키로 lookup
+    key_df = tmp.set_index([FACILITY_COL, DATE_COL])['_long_no_use']
+    anom_keys = list(zip(df_anom[FACILITY_COL], df_anom[DATE_COL]))
+    long_flag = pd.Series(
+        [bool(key_df.get(k, False)) for k in anom_keys],
+        index=df_anom.index,
+    )
+    return (
+        (df_anom['활성시즌'] == True)
+        & long_flag.values
+        & (df_anom['ma7_ratio'] >= q_long_ma7)
+    )
+
 
 def add_active_season(df):
     """종별에 따라 활성시즌 컬럼 추가 (냉수용은 냉방시즌 반전 적용)."""
@@ -123,22 +195,14 @@ def classify_types(df_anom, df_all):
     )
     df_anom = df_anom.merge(bl_q, on=['종별', '활성시즌'], how='left')
 
-    # ── (그룹 통계: 종별·활성시즌 사용량 95%분위 — 계절역행용, 정상 데이터만) ──
-    use_q = (
-        df_all[normal_mask].groupby(['종별', '활성시즌'], observed=True)['총사용량']
-        .quantile(SEASON_REV_QTILE).reset_index()
-        .rename(columns={'총사용량': 'use_q95'})
-    )
-    df_anom = df_anom.merge(use_q, on=['종별', '활성시즌'], how='left')
+    # ── (계절역행용 종별 임계는 SEASON_REV_QTILE_BY_TYPE로 아래에서 계산) ──
 
     # ── 분위 기준: 전체 데이터 기반 (이상 샘플 내부가 아님) ──
-    # 이상 샘플 내부 기준은 샘플 크기에 따라 절대 기준이 변동하므로
-    # 전체 데이터 분포 기준으로 임계를 설정하여 재현성 확보
     q_ma7 = df_all['ma7_ratio'].quantile(SURGE_MA7_QTILE)
     q_z = df_all['context_zscore'].abs().quantile(SURGE_Z_QTILE)
     q_ll = df_all['gmm_log_likelihood'].quantile(PATTERN_LL_QTILE)
     q_ae = df_all['ae_score'].quantile(PATTERN_AE_QTILE)
-    q_mp = df_all['mp_score'].quantile(PATTERN_AE_QTILE)
+    q_mp = df_all['mp_score'].quantile(PATTERN_MP_QTILE)
     q_long_ma7 = df_all['ma7_ratio'].quantile(LONG_MA7_QTILE)
 
     log_step(f'임계: ma7≥{q_ma7:.3f}, |z|≥{q_z:.2f}, '
@@ -150,30 +214,55 @@ def classify_types(df_anom, df_all):
         & (df_anom['context_zscore'].abs() >= q_z)
     )
 
-    night_thr = df_anom['nr_mean'] + NIGHT_SIGMA * df_anom['nr_std']
-    df_anom['type_야간이상형'] = df_anom['night_ratio'] >= night_thr
+    # (D)+(G) 야간이상형: 종별별 σ 차등 (주택용 +3σ, 나머지 +2σ)
+    sigma_per_row = (
+        df_anom['종별'].astype(str).map(NIGHT_SIGMA_BY_TYPE)
+        .fillna(2.0).astype(float).values
+    )
+    night_thr = df_anom['nr_mean'].values + sigma_per_row * df_anom['nr_std'].values
+    is_night_applicable = df_anom['종별'].isin(NIGHT_APPLICABLE_TYPES).values
+    df_anom['type_야간이상형'] = (
+        is_night_applicable
+        & (df_anom['night_ratio'].values >= night_thr)
+    )
 
+    # (A) 패턴이탈형 강화: AND 결합
+    #   GMM 하위 1% + (AE 상위 5% OR MP 상위 5%)
+    #   → 패턴 이상의 두 가지 독립 신호 모두 부합해야 인정
     df_anom['type_패턴이탈형'] = (
         (df_anom['gmm_log_likelihood'] <= q_ll)
-        | (df_anom['ae_score'] >= q_ae)
-        | (df_anom['mp_score'] >= q_mp)
+        & (
+            (df_anom['ae_score'] >= q_ae)
+            | (df_anom['mp_score'] >= q_mp)
+        )
     )
 
-    # 주의: zero_count는 "하루 24시간 중 0인 시간 수"이며,
-    # "연속 제로일 수"가 아님. 24시간 전부 0 = 미사용일로 간주.
-    # zero_count >= LONG_ZERO_DAYS(7)는 곧 "24시간 중 7시간 이상 0"이므로
-    # 실질적으로 저사용/미사용일을 포착. 엄밀한 "연속 N일 미사용"은
-    # 설비별 시계열 롤링이 필요하므로 향후 개선 과제.
-    df_anom['type_장기미사용후급증형'] = (
-        (df_anom['활성시즌'] == True)
-        & (df_anom['zero_count'] >= LONG_ZERO_DAYS)
-        & (df_anom['ma7_ratio'] >= q_long_ma7)
+    # (B) 장기미사용후급증형 재정의:
+    #   "설비별 직전 7일 연속 총사용량=0 → 다음날 ma7_ratio 상위 20%"
+    #   기존 zero_count(24시간 중 0인 시간 수)는 의미 불일치였음.
+    df_anom['type_장기미사용후급증형'] = compute_long_no_use_surge(
+        df_anom, df_all, q_long_ma7,
     )
 
+    # (C) 계절역행형: 종별별 분위 임계 차등
+    #   주택용은 절대 사용량이 작아 95%분위가 너무 느슨함 → 99%로 강화
+    season_thr_by_type = {}
+    for tname, qq in SEASON_REV_QTILE_BY_TYPE.items():
+        sub = df_all[(df_all['종별'] == tname) & (df_all['활성시즌'] == False)]
+        if len(sub):
+            season_thr_by_type[tname] = float(sub['총사용량'].quantile(qq))
+        else:
+            season_thr_by_type[tname] = np.inf
+    thr_per_row = (
+        df_anom['종별'].astype(str).map(season_thr_by_type)
+        .fillna(np.inf).astype(float).values
+    )
     df_anom['type_계절역행형'] = (
         (df_anom['활성시즌'] == False)
-        & (df_anom['총사용량'] >= df_anom['use_q95'])
+        & (df_anom['총사용량'].values >= thr_per_row)
     )
+    log_step('계절역행형 종별 임계: '
+             + ', '.join(f'{k}={v:.2f}' for k, v in season_thr_by_type.items()))
 
     # ── 주말이상형: 업무용/공공용 주말 사용량이 정상 평일 중위수 수준 이상 ──
     weekday_median = (
@@ -199,25 +288,72 @@ def classify_types(df_anom, df_all):
 
     df_anom['type_기저유량이상형'] = df_anom['baseload'] >= df_anom['bl_thr']
 
+    # (F) 신규 유형: 연속가동형
+    #   종별·활성시즌별 정상 hourly_std 5%분위와 baseload 80%분위 산출 후 결합
+    flat_std_q = (
+        df_all[normal_mask].groupby(['종별', '활성시즌'], observed=True)['hourly_std']
+        .quantile(FLAT_STD_QTILE).reset_index()
+        .rename(columns={'hourly_std': 'flat_std_thr'})
+    )
+    flat_bl_q = (
+        df_all[normal_mask].groupby(['종별', '활성시즌'], observed=True)['baseload']
+        .quantile(FLAT_BASELOAD_QTILE).reset_index()
+        .rename(columns={'baseload': 'flat_bl_thr'})
+    )
+    df_anom = df_anom.merge(flat_std_q, on=['종별', '활성시즌'], how='left')
+    df_anom = df_anom.merge(flat_bl_q, on=['종별', '활성시즌'], how='left')
+    df_anom['type_연속가동형'] = (
+        (df_anom['hourly_std'] <= df_anom['flat_std_thr'])
+        & (df_anom['baseload'] >= df_anom['flat_bl_thr'])
+    )
+    log_step('연속가동형 추가 (hourly_std 정상 하위 5% AND baseload 정상 상위 20%)')
+
+    # (I) 간헐사용형: cv·hourly_std 종별·활성시즌 정상 상위 5%
+    cv_q = (
+        df_all[normal_mask].groupby(['종별', '활성시즌'], observed=True)['cv']
+        .quantile(INTERMITTENT_CV_QTILE).reset_index()
+        .rename(columns={'cv': 'cv_thr'})
+    )
+    std_q = (
+        df_all[normal_mask].groupby(['종별', '활성시즌'], observed=True)['hourly_std']
+        .quantile(INTERMITTENT_STD_QTILE).reset_index()
+        .rename(columns={'hourly_std': 'std_thr'})
+    )
+    df_anom = df_anom.merge(cv_q, on=['종별', '활성시즌'], how='left')
+    df_anom = df_anom.merge(std_q, on=['종별', '활성시즌'], how='left')
+    df_anom['type_간헐사용형'] = (
+        (df_anom['cv'] >= df_anom['cv_thr'])
+        & (df_anom['hourly_std'] >= df_anom['std_thr'])
+    )
+    log_step('간헐사용형 추가 (cv 정상 상위 5% AND hourly_std 정상 상위 5%)')
+
     type_cols = [c for c in df_anom.columns if c.startswith('type_')]
 
     # ── 주 유형/보조 유형 ──
-    # 우선순위: 패턴이탈 > 급증 > 야간 > 기저 > 장기→급증 > 계절역행 > 주말
+    # (E) 우선순위 재정렬 (2026-05-13):
+    #   구체적 도메인 규칙 > 일반적 패턴 이상.
+    #   기존: 패턴이탈 1순위 → 70% 흡수되어 다른 유형 가려짐.
+    #   변경: 장기미사용·계절역행 (강한 규칙) → 야간·주말 (도메인) →
+    #         급증·기저 (값) → 패턴이탈 (fallback).
     PRIORITY = [
-        'type_패턴이탈형',
-        'type_급증형',
-        'type_야간이상형',
-        'type_기저유량이상형',
         'type_장기미사용후급증형',
         'type_계절역행형',
+        'type_야간이상형',
         'type_주말이상형',
+        'type_급증형',
+        'type_기저유량이상형',
+        'type_연속가동형',
+        'type_간헐사용형',
+        'type_패턴이탈형',
     ]
 
     def pick_primary(row):
         for c in PRIORITY:
             if row.get(c, False):
                 return c.replace('type_', '')
-        return '미분류'
+        # is_anomaly==1이지만 구체 유형 미부합 → 패턴이탈형 catch-all
+        # (이미 IF/AE/MP/stat 중 하나가 이상으로 판정한 행)
+        return '패턴이탈형'
 
     df_anom['primary_type'] = df_anom[type_cols].apply(pick_primary, axis=1)
 
@@ -640,14 +776,30 @@ def run():
         'thresholds': {
             'SURGE_MA7_QTILE': SURGE_MA7_QTILE,
             'SURGE_Z_QTILE': SURGE_Z_QTILE,
-            'NIGHT_SIGMA': NIGHT_SIGMA,
+            'NIGHT_SIGMA_BY_TYPE': NIGHT_SIGMA_BY_TYPE,
+            'NIGHT_APPLICABLE_TYPES': sorted(NIGHT_APPLICABLE_TYPES),
             'PATTERN_LL_QTILE': PATTERN_LL_QTILE,
             'PATTERN_AE_QTILE': PATTERN_AE_QTILE,
-            'LONG_ZERO_DAYS': LONG_ZERO_DAYS,
+            'PATTERN_MP_QTILE': PATTERN_MP_QTILE,
+            'PATTERN_RULE': 'gmm_ll<=q AND (ae>=q OR mp>=q)',
+            'LONG_NO_USE_DAYS': LONG_NO_USE_DAYS,
+            'LONG_NO_USE_RULE': 'prev 7 days all 총사용량=0 (시계열)',
             'LONG_MA7_QTILE': LONG_MA7_QTILE,
-            'SEASON_REV_QTILE': SEASON_REV_QTILE,
+            'SEASON_REV_QTILE_BY_TYPE': SEASON_REV_QTILE_BY_TYPE,
             'WEEKEND_RATIO': WEEKEND_RATIO,
             'BASELOAD_QTILE': BASELOAD_QTILE,
+            'FLAT_STD_QTILE': FLAT_STD_QTILE,
+            'FLAT_BASELOAD_QTILE': FLAT_BASELOAD_QTILE,
+            'FLAT_RULE': 'hourly_std<=정상 q5 AND baseload>=정상 q80',
+            'INTERMITTENT_CV_QTILE': INTERMITTENT_CV_QTILE,
+            'INTERMITTENT_STD_QTILE': INTERMITTENT_STD_QTILE,
+            'INTERMITTENT_RULE': 'cv>=정상 q95 AND hourly_std>=정상 q95',
+            'PATTERN_OUTLIER_FALLBACK': '구체 유형 미부합 시 catch-all로 패턴이탈형',
+            'PRIORITY_ORDER': [
+                '장기미사용후급증형', '계절역행형', '야간이상형', '주말이상형',
+                '급증형', '기저유량이상형', '연속가동형', '간헐사용형',
+                '패턴이탈형(fallback)',
+            ],
         },
         'primary_type_counts': {
             k: int(v)

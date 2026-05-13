@@ -8,10 +8,11 @@
 - [x] Phase 1. EDA
 - [x] Phase 2. 정밀 전처리
 - [x] Phase 3. Feature Engineering
-- [ ] **Phase 4. 정상 패턴 모델링** ← 진행 중 (GMM 학습 완료, predict/저장 미완료)
-- [ ] Phase 5. 이상 탐지 (IF + AE + **Matrix Profile** + 통계, 스크립트 완료, 미실행)
-- [ ] Phase 6. 유형 분류 및 결과 해석 (mp_score 패턴이탈형 반영, 스크립트 완료, 미실행)
-- [ ] Phase 7. 보고서 및 제출물 정리
+- [x] Phase 4. 정상 패턴 모델링 (GMM predict + Context Z-score 완료, `features_phase4.parquet`)
+- [x] Phase 5. 이상 탐지 (IF + AE + Matrix Profile + 통계 앙상블 완료, `features_phase5.parquet` + `anomaly_results.parquet`)
+- [x] Phase 6. 유형 분류 및 결과 해석 (**9유형, 미분류 0%**, `anomaly_classified.parquet` + SHAP 4종별)
+- [x] Phase 7. 알고리즘 성능 평가 (Ours F1=0.776 vs Base F1=0.756, **Precision 0.985 vs 0.689**)
+- [ ] **Phase 8. 보고서 및 제출물 정리** ← 다음 (최종보고서.md 누적 갱신 완료, 제출용 문서화 남음)
 
 ## 협업 프로세스
 
@@ -32,8 +33,9 @@
 | `최종보고서.md` | **누적 진행 보고서** (매 Phase 완료 시 업데이트) |
 | `Data description.txt` | 원본 데이터 설명서 |
 | `scripts/phase4_normal_pattern.py` | Phase 4 GMM 정상 패턴 모델링 코드 |
-| `scripts/phase5_anomaly_detection.py` | Phase 5 이상 탐지 코드 (IF + AE + 통계) |
+| `scripts/phase5_anomaly_detection.py` | Phase 5 이상 탐지 코드 (IF + AE + Matrix Profile + 통계) |
 | `scripts/phase6_classification.py` | Phase 6 유형 분류 및 SHAP 해석 코드 |
+| `scripts/phase7_evaluation.py` | Phase 7 알고리즘 성능 평가 (Synthetic Injection + ±30% 베이스라인) |
 
 ## 데이터 기본 정보
 
