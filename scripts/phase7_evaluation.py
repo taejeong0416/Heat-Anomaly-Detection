@@ -80,6 +80,20 @@ DAY_HOURS_1IDX = list(range(9, 19))   # 9~18시
 
 RANDOM_STATE = 42
 
+# Phase 6 규칙 기반 탐지 임계 (하이브리드 게이트 평가용)
+SURGE_MA7_QTILE = 0.90
+SURGE_Z_QTILE = 0.90
+BASELOAD_QTILE = 0.95
+SEASON_REV_QTILE_BY_TYPE = {
+    '주택용': 0.99, '업무용': 0.95, '공공용': 0.95, '냉수용': 0.95,
+}
+WEEKEND_RATIO = 0.8
+FLAT_STD_QTILE = 0.05
+FLAT_BASELOAD_QTILE = 0.80
+INTERMITTENT_CV_QTILE = 0.95
+INTERMITTENT_STD_QTILE = 0.95
+LONG_MA7_QTILE = 0.80
+
 
 # ============================================================
 # 1. AE 정의 (Phase 5와 동일)
@@ -383,6 +397,126 @@ def score_with_our_algo(eval_df, df_all):
 
 
 # ============================================================
+# 5b. 하이브리드 게이트: 규칙 기반 탐지
+# ============================================================
+
+def apply_rule_detection(eval_df, df_all):
+    """
+    하이브리드 게이트의 규칙 기반 유형 탐지.
+    Phase 6의 규칙 기반 7유형을 eval_df에 적용,
+    하나 이상 매칭되면 flag=1.
+    """
+    normal_mask = df_all['is_anomaly'] == 0
+
+    # 활성시즌 보장
+    for d in (eval_df, df_all):
+        if '활성시즌' not in d.columns:
+            is_cold = d['종별'] == '냉수용'
+            d['활성시즌'] = np.where(
+                is_cold, d['냉방시즌'].astype(bool), d['난방시즌'].astype(bool)
+            )
+
+    # ── 급증형 ──
+    q_ma7 = df_all['ma7_ratio'].quantile(SURGE_MA7_QTILE)
+    q_z = df_all['context_zscore'].abs().quantile(SURGE_Z_QTILE)
+    rule_surge = (
+        (eval_df['ma7_ratio'] >= q_ma7)
+        & (eval_df['context_zscore'].abs() >= q_z)
+    )
+
+    # ── 계절역행형 ──
+    season_thr = {}
+    for tname, qq in SEASON_REV_QTILE_BY_TYPE.items():
+        sub = df_all[(df_all['종별'] == tname) & (df_all['활성시즌'] == False)]
+        season_thr[tname] = float(sub['총사용량'].quantile(qq)) if len(sub) else np.inf
+    thr_row = eval_df['종별'].map(season_thr).fillna(np.inf).values
+    rule_season = (
+        (eval_df['활성시즌'] == False)
+        & (eval_df['총사용량'].values >= thr_row)
+    )
+
+    # ── 주말이상형 ──
+    wk_med_lookup = (
+        df_all[normal_mask
+               & df_all['종별'].isin(['업무용', '공공용'])
+               & (~df_all['is_weekend'].astype(bool))
+               & (~df_all['is_holiday'].astype(bool))]
+        .groupby(['종별', '월'], observed=True)['총사용량']
+        .median()
+    )
+    wk_keys = list(zip(eval_df['종별'], eval_df['월']))
+    wk_med = np.array([wk_med_lookup.get(k, np.inf) for k in wk_keys])
+    is_off = eval_df['is_weekend'].astype(bool) | eval_df['is_holiday'].astype(bool)
+    rule_weekend = (
+        eval_df['종별'].isin(['업무용', '공공용'])
+        & is_off
+        & (eval_df['총사용량'].values >= wk_med * WEEKEND_RATIO)
+    )
+
+    # ── 기저유량이상형 ──
+    bl_lookup = (
+        df_all[normal_mask]
+        .groupby(['종별', '활성시즌'], observed=True)['baseload']
+        .quantile(BASELOAD_QTILE)
+    )
+    bl_keys = list(zip(eval_df['종별'], eval_df['활성시즌']))
+    bl_vals = np.array([bl_lookup.get(k, np.inf) for k in bl_keys])
+    rule_baseload = eval_df['baseload'].values >= bl_vals
+
+    # ── 장기미사용후급증형 (간이 proxy: zero_count≥20 AND ma7_ratio≥q80) ──
+    q_long_ma7 = df_all['ma7_ratio'].quantile(LONG_MA7_QTILE)
+    rule_long = (
+        (eval_df['zero_count'] >= 20)
+        & (eval_df['ma7_ratio'] >= q_long_ma7)
+    )
+
+    # ── 연속가동형 ──
+    flat_std_lookup = (
+        df_all[normal_mask]
+        .groupby(['종별', '활성시즌'], observed=True)['hourly_std']
+        .quantile(FLAT_STD_QTILE)
+    )
+    flat_bl_lookup = (
+        df_all[normal_mask]
+        .groupby(['종별', '활성시즌'], observed=True)['baseload']
+        .quantile(FLAT_BASELOAD_QTILE)
+    )
+    fs_keys = list(zip(eval_df['종별'], eval_df['활성시즌']))
+    fs_vals = np.array([flat_std_lookup.get(k, np.inf) for k in fs_keys])
+    fb_vals = np.array([flat_bl_lookup.get(k, 0) for k in fs_keys])
+    rule_flat = (
+        (eval_df['hourly_std'].values <= fs_vals)
+        & (eval_df['baseload'].values >= fb_vals)
+    )
+
+    # ── 간헐사용형 ──
+    cv_lookup = (
+        df_all[normal_mask]
+        .groupby(['종별', '활성시즌'], observed=True)['cv']
+        .quantile(INTERMITTENT_CV_QTILE)
+    )
+    std_lookup = (
+        df_all[normal_mask]
+        .groupby(['종별', '활성시즌'], observed=True)['hourly_std']
+        .quantile(INTERMITTENT_STD_QTILE)
+    )
+    cv_vals = np.array([cv_lookup.get(k, np.inf) for k in fs_keys])
+    st_vals = np.array([std_lookup.get(k, np.inf) for k in fs_keys])
+    rule_intermittent = (
+        (eval_df['cv'].values >= cv_vals)
+        & (eval_df['hourly_std'].values >= st_vals)
+    )
+
+    rule_any = (
+        rule_surge | rule_season | rule_weekend | rule_baseload
+        | rule_long | rule_flat | rule_intermittent
+    )
+    n_rule = int(rule_any.sum())
+    print(f'  규칙 기반 탐지: {n_rule}건')
+    return rule_any.astype(np.int8).values
+
+
+# ============================================================
 # 6. 메인
 # ============================================================
 
@@ -466,17 +600,30 @@ def main():
     n_neg = len(eval_df) - n_pos
     print(f'  평가셋: {len(eval_df):,}행 (정상 {n_neg:,}, 이상 {n_pos:,})')
 
-    # ── 우리 알고리즘 ──
-    print('\n[우리 알고리즘 적용 (IF + AE + 통계)]')
-    ours_flag, if_scores, ae_scores, if_f, ae_f, sz_f, si_f = \
+    # ── 우리 알고리즘 (모델 + 규칙 하이브리드) ──
+    print('\n[모델 기반 탐지 (IF + AE + 통계)]')
+    model_flag, if_scores, ae_scores, if_f, ae_f, sz_f, si_f = \
         score_with_our_algo(eval_df, df)
-    eval_df['ours_flag'] = ours_flag
     eval_df['if_score_eval'] = if_scores
     eval_df['ae_score_eval'] = ae_scores
     eval_df['if_flag_eval'] = if_f
     eval_df['ae_flag_eval'] = ae_f
     eval_df['stat_z_flag_eval'] = sz_f
     eval_df['stat_iqr_flag_eval'] = si_f
+
+    # ── 규칙 기반 탐지 (하이브리드 게이트) ──
+    print('\n[규칙 기반 탐지 (하이브리드 게이트)]')
+    rule_flag = apply_rule_detection(eval_df, df)
+    eval_df['rule_flag_eval'] = rule_flag
+
+    # ── 하이브리드 앙상블: 모델 OR 규칙 ──
+    ours_flag = ((model_flag + rule_flag) >= 1).astype(np.int8)
+    eval_df['ours_flag'] = ours_flag
+    n_model_only = int(((model_flag == 1) & (rule_flag == 0)).sum())
+    n_rule_only = int(((model_flag == 0) & (rule_flag == 1)).sum())
+    n_both = int(((model_flag == 1) & (rule_flag == 1)).sum())
+    print(f'  하이브리드: 모델만={n_model_only}, 규칙만={n_rule_only}, '
+          f'양쪽={n_both}, 합계={int(ours_flag.sum())}')
 
     # ── 베이스라인 ──
     print('[베이스라인 ±30% 적용]')
@@ -660,7 +807,7 @@ def main():
             'if_top_pct': 0.02,
             'ae_top_pct': 0.03,
             'baseline_threshold': 0.30,
-            'ensemble': 'IF OR AE (recall 우선)',
+            'ensemble': '하이브리드 게이트: (IF|AE|stat) OR 규칙 기반 7유형',
         },
         'limitations': [
             '합성 이상은 실제 이상의 근사이며 도메인 케이스를 완전히 커버하지 않음',

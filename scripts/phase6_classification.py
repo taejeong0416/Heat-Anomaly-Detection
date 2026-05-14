@@ -1,7 +1,7 @@
 """
-Phase 6. 이상 유형 분류 및 결과 해석
-Phase 5에서 이상으로 판정된 샘플(`is_anomaly==1`)에 대해
-이상유형정의.md / 분석플랜 5-1의 7개 이상사용 유형 규칙을 적용하고,
+Phase 6. 이상 유형 분류 및 결과 해석 (하이브리드 게이트)
+규칙 기반 7유형은 전체 데이터에 적용하고,
+모델 의존 2유형(야간이상형·패턴이탈형)은 Phase 5 is_anomaly==1 행에만 적용.
 SHAP 해석 + 결과 시각화를 수행한다.
 
 이상사용 유형 (분석플랜 5-1):
@@ -126,33 +126,26 @@ def log_step(msg):
 # 1. 유형 분류 규칙
 # ============================================================
 
-def compute_long_no_use_surge(df_anom, df_all, q_long_ma7):
+def compute_long_no_use_surge(df, q_long_ma7):
     """
-    (B) 장기미사용후급증형 재정의:
-      설비별 시계열을 일자 정렬해 "직전 7일 연속 총사용량=0" 이후
+    (B) 장기미사용후급증형:
+      설비별 시계열에서 직전 7일 연속 총사용량=0 이후
       당일 ma7_ratio가 q_long_ma7 이상이면 True.
-    df_all에서 설비별 롤링 계산 후 df_anom 인덱스로 lookup.
     """
-    # 설비-날짜 정렬 후 직전 7일 0 여부 계산
-    tmp = df_all[[FACILITY_COL, DATE_COL, '총사용량']].copy()
+    tmp = df[[FACILITY_COL, DATE_COL, '총사용량']].copy()
+    tmp['_orig_pos'] = np.arange(len(tmp))
     tmp = tmp.sort_values([FACILITY_COL, DATE_COL])
-    # 직전 7일 모두 0인지: 이전 7개 값의 합 == 0
     tmp['_rolling_sum_prev7'] = (
         tmp.groupby(FACILITY_COL)['총사용량']
         .transform(lambda s: s.shift(1).rolling(7, min_periods=7).sum())
     )
-    tmp['_long_no_use'] = (tmp['_rolling_sum_prev7'] == 0)
-    # df_anom의 (설치, 날짜) 키로 lookup
-    key_df = tmp.set_index([FACILITY_COL, DATE_COL])['_long_no_use']
-    anom_keys = list(zip(df_anom[FACILITY_COL], df_anom[DATE_COL]))
-    long_flag = pd.Series(
-        [bool(key_df.get(k, False)) for k in anom_keys],
-        index=df_anom.index,
-    )
+    # 원래 행 순서로 복원 (인덱스 값에 의존하지 않음)
+    tmp = tmp.sort_values('_orig_pos')
+    long_flag = (tmp['_rolling_sum_prev7'] == 0).fillna(False).values
     return (
-        (df_anom['활성시즌'] == True)
-        & long_flag.values
-        & (df_anom['ma7_ratio'] >= q_long_ma7)
+        (df['활성시즌'] == True)
+        & long_flag
+        & (df['ma7_ratio'] >= q_long_ma7)
     )
 
 
@@ -165,18 +158,19 @@ def add_active_season(df):
     return df
 
 
-def classify_types(df_anom, df_all):
+def classify_types(df_all):
     """
-    이상 샘플(df_anom)에 7개 유형 규칙을 적용.
+    하이브리드 게이트 유형 분류.
 
-    Parameters:
-      df_anom: is_anomaly==1 행 (분류 대상)
-      df_all : 전체 데이터 (그룹 통계 산출용)
+    규칙 기반 7유형은 전체 데이터에 적용 (게이트 없음),
+    야간이상형·패턴이탈형은 Phase 5 is_anomaly==1 행에만 적용.
+    is_anomaly==1이면서 어떤 규칙에도 해당 없으면 catch-all 패턴이탈형.
 
     Returns:
-      df_anom: 'type_*' boolean 컬럼 7개 + 'primary_type' + 'secondary_types'
+      유형 배정된 행만 반환 (primary_type != '정상')
     """
-    print('\n[유형 규칙 적용]')
+    print('\n[유형 규칙 적용 — 하이브리드 게이트]')
+    df_anom = df_all  # 전체 데이터 대상; merge 시 새 DataFrame 생성됨
 
     # ── (그룹 통계: 종별·월 night_ratio 평균/표준편차, 정상 데이터만) ──
     normal_mask = df_all['is_anomaly'] == 0
@@ -215,6 +209,8 @@ def classify_types(df_anom, df_all):
     )
 
     # (D)+(G) 야간이상형: 종별별 σ 차등 (주택용 +3σ, 나머지 +2σ)
+    #   → 모델 의존 유형: is_anomaly==1 행에만 적용 (night_ratio는 모델 점수와 결합)
+    model_gate = (df_anom['is_anomaly'] == 1).values
     sigma_per_row = (
         df_anom['종별'].astype(str).map(NIGHT_SIGMA_BY_TYPE)
         .fillna(2.0).astype(float).values
@@ -222,15 +218,16 @@ def classify_types(df_anom, df_all):
     night_thr = df_anom['nr_mean'].values + sigma_per_row * df_anom['nr_std'].values
     is_night_applicable = df_anom['종별'].isin(NIGHT_APPLICABLE_TYPES).values
     df_anom['type_야간이상형'] = (
-        is_night_applicable
+        model_gate
+        & is_night_applicable
         & (df_anom['night_ratio'].values >= night_thr)
     )
 
     # (A) 패턴이탈형 강화: AND 결합
-    #   GMM 하위 1% + (AE 상위 5% OR MP 상위 5%)
-    #   → 패턴 이상의 두 가지 독립 신호 모두 부합해야 인정
+    #   → 모델 의존 유형: is_anomaly==1 행에만 적용 (GMM/AE/MP 모델 점수 기반)
     df_anom['type_패턴이탈형'] = (
-        (df_anom['gmm_log_likelihood'] <= q_ll)
+        model_gate
+        & (df_anom['gmm_log_likelihood'] <= q_ll)
         & (
             (df_anom['ae_score'] >= q_ae)
             | (df_anom['mp_score'] >= q_mp)
@@ -241,7 +238,7 @@ def classify_types(df_anom, df_all):
     #   "설비별 직전 7일 연속 총사용량=0 → 다음날 ma7_ratio 상위 20%"
     #   기존 zero_count(24시간 중 0인 시간 수)는 의미 불일치였음.
     df_anom['type_장기미사용후급증형'] = compute_long_no_use_surge(
-        df_anom, df_all, q_long_ma7,
+        df_anom, q_long_ma7,
     )
 
     # (C) 계절역행형: 종별별 분위 임계 차등
@@ -347,24 +344,31 @@ def classify_types(df_anom, df_all):
         'type_패턴이탈형',
     ]
 
-    def pick_primary(row):
-        for c in PRIORITY:
-            if row.get(c, False):
-                return c.replace('type_', '')
-        # is_anomaly==1이지만 구체 유형 미부합 → 패턴이탈형 catch-all
-        # (이미 IF/AE/MP/stat 중 하나가 이상으로 판정한 행)
-        return '패턴이탈형'
+    # ── 벡터화된 primary_type 배정 (역순 우선순위 → 높은 우선순위가 덮어씀) ──
+    primary = pd.Series('정상', index=df_anom.index)
+    for c in reversed(PRIORITY):
+        mask = df_anom[c].astype(bool)
+        primary = primary.where(~mask, c.replace('type_', ''))
 
-    df_anom['primary_type'] = df_anom[type_cols].apply(pick_primary, axis=1)
+    # Catch-all: is_anomaly==1이면서 어떤 규칙에도 미부합 → 패턴이탈형
+    no_type = (primary == '정상') & (df_anom['is_anomaly'] == 1)
+    primary[no_type] = '패턴이탈형'
+    df_anom['primary_type'] = primary
 
-    def pick_secondary(row):
-        prim = 'type_' + row['primary_type']
-        return ','.join(
-            c.replace('type_', '')
-            for c in type_cols if row.get(c, False) and c != prim
+    # ── secondary_types (다중 유형 행만 처리, 성능 최적화) ──
+    n_types = df_anom[type_cols].sum(axis=1)
+    df_anom['secondary_types'] = ''
+    multi = n_types > 1
+    if multi.any():
+        def pick_secondary(row):
+            prim = 'type_' + row['primary_type']
+            return ','.join(
+                c.replace('type_', '')
+                for c in type_cols if row.get(c, False) and c != prim
+            )
+        df_anom.loc[multi, 'secondary_types'] = (
+            df_anom.loc[multi].apply(pick_secondary, axis=1)
         )
-
-    df_anom['secondary_types'] = df_anom.apply(pick_secondary, axis=1)
 
     # ── 심각도 (0~1로 정규화된 IF score, 전체 데이터 기준) ──
     if_valid = df_all['if_score'].dropna()
@@ -377,13 +381,22 @@ def classify_types(df_anom, df_all):
     else:
         df_anom['severity'] = np.float32(0.5)
 
-    # 통계 출력
-    counts = df_anom['primary_type'].value_counts()
-    print('\n  주 유형 분포:')
-    for k, v in counts.items():
-        print(f'    {k}: {v:,} ({v/len(df_anom)*100:.1f}%)')
+    # ── 이상 행만 필터 (정상 제외) ──
+    anom_result = df_anom[df_anom['primary_type'] != '정상'].copy()
 
-    return df_anom
+    # 통계 출력
+    counts = anom_result['primary_type'].value_counts()
+    print(f'\n  이상 유형 배정: {len(anom_result):,}행 '
+          f'(전체 {len(df_anom):,}행 중)')
+    for k, v in counts.items():
+        print(f'    {k}: {v:,} ({v/len(anom_result)*100:.1f}%)')
+
+    # 규칙 전용 탐지 비율 출력
+    n_rule_only = int((anom_result['is_anomaly'] == 0).sum())
+    n_model = int((anom_result['is_anomaly'] == 1).sum())
+    print(f'  (모델 탐지: {n_model:,}, 규칙 추가 탐지: {n_rule_only:,})')
+
+    return anom_result
 
 
 # ============================================================
@@ -678,18 +691,17 @@ def run():
     df_all = add_active_season(df_all)
     print(f'  전체: {len(df_all):,}행, {len(df_all.columns)}개 컬럼')
 
-    # ── 이상 샘플 분리 ──
-    df_anom = df_all[df_all['is_anomaly'] == 1].copy()
-    print(f'  이상 샘플: {len(df_anom):,}행 '
-          f'({len(df_anom)/len(df_all)*100:.2f}%)')
+    # ── 하이브리드 게이트 유형 분류 ──
+    n_model_anom = int((df_all['is_anomaly'] == 1).sum())
+    print(f'  Phase 5 모델 이상: {n_model_anom:,}행 '
+          f'({n_model_anom/len(df_all)*100:.2f}%)')
+
+    df_anom = classify_types(df_all)
+    log_step(f'유형 분류 완료: {len(df_anom):,}행')
 
     if len(df_anom) == 0:
-        print('  이상 샘플이 없습니다. Phase 5 결과 확인 필요.')
+        print('  이상 샘플이 없습니다.')
         return
-
-    # ── 유형 분류 ──
-    df_anom = classify_types(df_anom, df_all)
-    log_step(f'유형 분류 완료: {len(df_anom):,}행')
 
     # ── 시각화 ──
     print('\n[시각화]')
