@@ -1,7 +1,7 @@
 """
-Phase 6. 이상 유형 분류 및 결과 해석 (하이브리드 게이트)
-규칙 기반 7유형은 전체 데이터에 적용하고,
-모델 의존 2유형(야간이상형·패턴이탈형)은 Phase 5 is_anomaly==1 행에만 적용.
+Phase 6. 이상 유형 분류 및 결과 해석
+9유형 전부 규칙 기반으로 전체 데이터에 적용.
+is_anomaly==1이지만 어떤 규칙에도 해당하지 않는 행은 패턴이탈형(catch-all)으로 분류.
 SHAP 해석 + 결과 시각화를 수행한다.
 
 이상사용 유형 (분석플랜 5-1):
@@ -160,16 +160,15 @@ def add_active_season(df):
 
 def classify_types(df_all):
     """
-    하이브리드 게이트 유형 분류.
+    9유형 규칙 기반 분류.
 
-    규칙 기반 7유형은 전체 데이터에 적용 (게이트 없음),
-    야간이상형·패턴이탈형은 Phase 5 is_anomaly==1 행에만 적용.
+    9유형 전부 전체 데이터에 규칙 적용 (게이트 없음).
     is_anomaly==1이면서 어떤 규칙에도 해당 없으면 catch-all 패턴이탈형.
 
     Returns:
       유형 배정된 행만 반환 (primary_type != '정상')
     """
-    print('\n[유형 규칙 적용 — 하이브리드 게이트]')
+    print('\n[유형 규칙 적용 — 9유형 전체 데이터]')
     df_anom = df_all  # 전체 데이터 대상; merge 시 새 DataFrame 생성됨
 
     # ── (그룹 통계: 종별·월 night_ratio 평균/표준편차, 정상 데이터만) ──
@@ -209,8 +208,6 @@ def classify_types(df_all):
     )
 
     # (D)+(G) 야간이상형: 종별별 σ 차등 (주택용 +3σ, 나머지 +2σ)
-    #   → 모델 의존 유형: is_anomaly==1 행에만 적용 (night_ratio는 모델 점수와 결합)
-    model_gate = (df_anom['is_anomaly'] == 1).values
     sigma_per_row = (
         df_anom['종별'].astype(str).map(NIGHT_SIGMA_BY_TYPE)
         .fillna(2.0).astype(float).values
@@ -218,16 +215,13 @@ def classify_types(df_all):
     night_thr = df_anom['nr_mean'].values + sigma_per_row * df_anom['nr_std'].values
     is_night_applicable = df_anom['종별'].isin(NIGHT_APPLICABLE_TYPES).values
     df_anom['type_야간이상형'] = (
-        model_gate
-        & is_night_applicable
+        is_night_applicable
         & (df_anom['night_ratio'].values >= night_thr)
     )
 
-    # (A) 패턴이탈형 강화: AND 결합
-    #   → 모델 의존 유형: is_anomaly==1 행에만 적용 (GMM/AE/MP 모델 점수 기반)
+    # (A) 패턴이탈형: GMM log-likelihood 하위 AND AE/MP 상위 교집합
     df_anom['type_패턴이탈형'] = (
-        model_gate
-        & (df_anom['gmm_log_likelihood'] <= q_ll)
+        (df_anom['gmm_log_likelihood'] <= q_ll)
         & (
             (df_anom['ae_score'] >= q_ae)
             | (df_anom['mp_score'] >= q_mp)
@@ -691,7 +685,7 @@ def run():
     df_all = add_active_season(df_all)
     print(f'  전체: {len(df_all):,}행, {len(df_all.columns)}개 컬럼')
 
-    # ── 하이브리드 게이트 유형 분류 ──
+    # ── 9유형 규칙 기반 분류 ──
     n_model_anom = int((df_all['is_anomaly'] == 1).sum())
     print(f'  Phase 5 모델 이상: {n_model_anom:,}행 '
           f'({n_model_anom/len(df_all)*100:.2f}%)')

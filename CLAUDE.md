@@ -10,8 +10,8 @@
 - [x] Phase 3. Feature Engineering
 - [x] Phase 4. 정상 패턴 모델링 (GMM predict + Context Z-score 완료, `features_phase4.parquet`)
 - [x] Phase 5. 이상 탐지 (IF + AE + Matrix Profile + 통계 앙상블 완료, `features_phase5.parquet` + `anomaly_results.parquet`)
-- [x] Phase 6. 유형 분류 및 결과 해석 (**9유형, 하이브리드 게이트**, `anomaly_classified.parquet` + SHAP 4종별)
-- [x] Phase 7. 알고리즘 성능 평가 (하이브리드 게이트: 모델+규칙 OR 앙상블, Synthetic Injection 평가)
+- [x] Phase 6. 유형 분류 및 결과 해석 (**9유형 규칙 기반**, `anomaly_classified.parquet` + SHAP 4종별)
+- [x] Phase 7. 알고리즘 성능 평가 (모델+규칙 OR 앙상블, Synthetic Injection 평가)
 - [ ] **Phase 8. 보고서 및 제출물 정리** ← 다음 (최종보고서.md 누적 갱신 완료, 제출용 문서화 남음)
 
 ## 협업 프로세스
@@ -34,7 +34,7 @@
 | `Data description.txt` | 원본 데이터 설명서 |
 | `scripts/phase4_normal_pattern.py` | Phase 4 GMM 정상 패턴 모델링 코드 |
 | `scripts/phase5_anomaly_detection.py` | Phase 5 이상 탐지 코드 (IF + AE + Matrix Profile + 통계) |
-| `scripts/phase6_classification.py` | Phase 6 유형 분류 (하이브리드 게이트) 및 SHAP 해석 코드 |
+| `scripts/phase6_classification.py` | Phase 6 유형 분류 (9유형 규칙 기반) 및 SHAP 해석 코드 |
 | `scripts/phase7_evaluation.py` | Phase 7 알고리즘 성능 평가 (모델+규칙 하이브리드 + ±30% 베이스라인) |
 
 ## 데이터 기본 정보

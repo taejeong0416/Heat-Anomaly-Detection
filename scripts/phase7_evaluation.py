@@ -80,7 +80,7 @@ DAY_HOURS_1IDX = list(range(9, 19))   # 9~18시
 
 RANDOM_STATE = 42
 
-# Phase 6 규칙 기반 탐지 임계 (하이브리드 게이트 평가용)
+# Phase 6 규칙 기반 탐지 임계
 SURGE_MA7_QTILE = 0.90
 SURGE_Z_QTILE = 0.90
 BASELOAD_QTILE = 0.95
@@ -93,6 +93,10 @@ FLAT_BASELOAD_QTILE = 0.80
 INTERMITTENT_CV_QTILE = 0.95
 INTERMITTENT_STD_QTILE = 0.95
 LONG_MA7_QTILE = 0.80
+NIGHT_SIGMA_BY_TYPE = {
+    '주택용': 3.0, '업무용': 2.0, '공공용': 2.0, '냉수용': 2.0,
+}
+NIGHT_APPLICABLE_TYPES = ['주택용', '업무용', '공공용']
 
 
 # ============================================================
@@ -397,14 +401,14 @@ def score_with_our_algo(eval_df, df_all):
 
 
 # ============================================================
-# 5b. 하이브리드 게이트: 규칙 기반 탐지
+# 5b. 규칙 기반 탐지 (8유형)
 # ============================================================
 
 def apply_rule_detection(eval_df, df_all):
     """
-    하이브리드 게이트의 규칙 기반 유형 탐지.
-    Phase 6의 규칙 기반 7유형을 eval_df에 적용,
+    규칙 기반 8유형 탐지 (야간이상형 포함).
     하나 이상 매칭되면 flag=1.
+    (패턴이탈형은 모델 점수와 거의 겹치므로 생략)
     """
     normal_mask = df_all['is_anomaly'] == 0
 
@@ -507,9 +511,24 @@ def apply_rule_detection(eval_df, df_all):
         & (eval_df['hourly_std'].values >= st_vals)
     )
 
+    # ── 야간이상형 ──
+    nr_stats = (
+        df_all[normal_mask]
+        .groupby('종별', observed=True)['night_ratio']
+        .agg(['mean', 'std'])
+    )
+    nr_mean = eval_df['종별'].map(nr_stats['mean']).fillna(0).values
+    nr_std = eval_df['종별'].map(nr_stats['std']).fillna(1).values
+    sigma_arr = eval_df['종별'].map(NIGHT_SIGMA_BY_TYPE).fillna(2.0).values
+    night_thr = nr_mean + sigma_arr * nr_std
+    rule_night = (
+        eval_df['종별'].isin(NIGHT_APPLICABLE_TYPES)
+        & (eval_df['night_ratio'].values >= night_thr)
+    )
+
     rule_any = (
         rule_surge | rule_season | rule_weekend | rule_baseload
-        | rule_long | rule_flat | rule_intermittent
+        | rule_long | rule_flat | rule_intermittent | rule_night
     )
     n_rule = int(rule_any.sum())
     print(f'  규칙 기반 탐지: {n_rule}건')
@@ -611,8 +630,8 @@ def main():
     eval_df['stat_z_flag_eval'] = sz_f
     eval_df['stat_iqr_flag_eval'] = si_f
 
-    # ── 규칙 기반 탐지 (하이브리드 게이트) ──
-    print('\n[규칙 기반 탐지 (하이브리드 게이트)]')
+    # ── 규칙 기반 탐지 (8유형) ──
+    print('\n[규칙 기반 탐지 (8유형)]')
     rule_flag = apply_rule_detection(eval_df, df)
     eval_df['rule_flag_eval'] = rule_flag
 
@@ -807,7 +826,7 @@ def main():
             'if_top_pct': 0.02,
             'ae_top_pct': 0.03,
             'baseline_threshold': 0.30,
-            'ensemble': '하이브리드 게이트: (IF|AE|stat) OR 규칙 기반 7유형',
+            'ensemble': '(IF|AE|stat) OR 규칙 기반 8유형',
         },
         'limitations': [
             '합성 이상은 실제 이상의 근사이며 도메인 케이스를 완전히 커버하지 않음',
