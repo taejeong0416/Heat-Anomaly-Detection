@@ -37,8 +37,8 @@ DATE_COL = '날짜'
 
 PROCESSED_DIR = 'data/processed'
 FIG_DIR = 'outputs/figures'
-MODEL_DIR = 'outputs/phase5_models'
-PHASE6_DIR = 'outputs/phase6'
+MODEL_DIR = 'models/anomaly'
+PHASE6_DIR = 'outputs/results'
 
 TYPES = ['주택용', '업무용', '공공용', '냉수용']
 
@@ -658,7 +658,7 @@ def run():
 
     # ── 데이터 로드 ──
     print('\n[데이터 로드]')
-    input_path = f'{PROCESSED_DIR}/features_phase5.parquet'
+    input_path = f'{PROCESSED_DIR}/features.parquet'
 
     import pyarrow.parquet as pq
     _table = pq.read_table(input_path)

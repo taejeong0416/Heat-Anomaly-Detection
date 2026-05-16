@@ -42,10 +42,10 @@ FACILITY_COL = '설치'
 DATE_COL = '날짜'
 
 PROCESSED = 'data/processed'
-MODEL_DIR = 'outputs/phase5_models'
-GMM_DIR = 'outputs/phase4_gmm'
+MODEL_DIR = 'models/anomaly'
+GMM_DIR = 'models/gmm'
 FIG_DIR = 'outputs/figures'
-PHASE7_DIR = 'outputs/phase7'
+PHASE7_DIR = 'outputs/results'
 
 TYPES = ['주택용', '업무용', '공공용', '냉수용']
 
@@ -549,9 +549,9 @@ def main():
     os.makedirs(FIG_DIR, exist_ok=True)
 
     print('\n[데이터 로드]')
-    df = pd.read_parquet(f'{PROCESSED}/features_phase5.parquet')
+    df = pd.read_parquet(f'{PROCESSED}/features.parquet')
     df[DATE_COL] = pd.to_datetime(df[DATE_COL])
-    print(f'  features_phase5: {len(df):,}행')
+    print(f'  features: {len(df):,}행')
 
     normal = df[(df['is_anomaly'] == 0) & (df['총사용량'] > 0)].copy()
     print(f'  정상 후보: {len(normal):,}행')
@@ -793,7 +793,7 @@ def main():
             )
             print(f'  → {review_path} ({len(review_df)}건)')
     else:
-        print(f'  ⚠ {classified_path} 없음 → 수동 검토 표본 생략')
+        print(f'  [SKIP] {classified_path} 없음 -> 수동 검토 표본 생략')
 
     # ========================================================
     # 산출물 저장

@@ -58,7 +58,7 @@ DATE_COL = '날짜'
 
 PROCESSED_DIR = 'data/processed'
 FIG_DIR = 'outputs/figures'
-MODEL_DIR = 'outputs/phase5_models'
+MODEL_DIR = 'models/anomaly'
 
 # 종별 (4그룹) — Isolation Forest / AE 종별 분리 학습
 TYPES = ['주택용', '업무용', '공공용', '냉수용']
@@ -562,7 +562,7 @@ def run():
 
     # ── 데이터 로드 ──
     print('\n[데이터 로드]')
-    input_path = f'{PROCESSED_DIR}/features_phase4.parquet'
+    input_path = f'{PROCESSED_DIR}/features.parquet'
 
     import pyarrow.parquet as pq
     _table = pq.read_table(input_path)
@@ -823,7 +823,7 @@ def run():
     print('\n[저장]')
 
     # 1) 전체 피처 + 이상 결과 (모든 행 포함)
-    full_path = f'{PROCESSED_DIR}/features_phase5.parquet'
+    full_path = f'{PROCESSED_DIR}/features.parquet'
     df.to_parquet(full_path, index=False)
     full_size = os.path.getsize(full_path) / (1024 ** 2)
     print(f'  전체 피처+결과: {full_path} ({full_size:.1f} MB)')

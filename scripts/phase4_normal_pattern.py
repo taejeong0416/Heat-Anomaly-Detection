@@ -26,7 +26,7 @@ DATE_COL = '날짜'
 
 PROCESSED_DIR = 'data/processed'
 FIG_DIR = 'outputs/figures'
-GMM_DIR = 'outputs/phase4_gmm'
+GMM_DIR = 'models/gmm'
 
 # 종별×시즌 8그룹 정의
 GROUPS = [
@@ -44,7 +44,7 @@ GROUPS = [
 K_RANGE_DEFAULT = range(2, 9)   # 난방 3종별
 K_RANGE_COLD = range(2, 5)      # 냉수용 (소규모)
 SAMPLE_SIZE = 150_000            # 학습용 샘플 크기
-REG_COVAR = 1e-6                 # 공분산 정규화
+REG_COVAR = 1e-4                 # 공분산 정규화 (singular 방지)
 
 log = []
 
@@ -110,18 +110,7 @@ def fit_gmm_for_group(X, group_name, k_range, save_dir):
 
     print(f'    → 최적 k={best_k} (BIC={best_bic:,.0f})')
 
-    # 전체 데이터로 재학습 (샘플이 아닌 전체)
-    if len(X) > SAMPLE_SIZE:
-        print(f'    전체 데이터({len(X):,}행)로 재학습...')
-        best_gmm = GaussianMixture(
-            n_components=best_k,
-            covariance_type='full',
-            reg_covar=REG_COVAR,
-            max_iter=200,
-            n_init=3,
-            random_state=42,
-        )
-        best_gmm.fit(X)
+    # 15만 샘플이면 GMM 파라미터 수렴에 충분 — 전체 재학습 생략
 
     # 모델 저장
     model_path = os.path.join(save_dir, f'gmm_model_{group_name}.pkl')
@@ -357,7 +346,7 @@ def run():
     print('\n[저장]')
 
     # 피처 데이터
-    output_path = f'{PROCESSED_DIR}/features_phase4.parquet'
+    output_path = f'{PROCESSED_DIR}/features.parquet'
     df.to_parquet(output_path, index=False)
     file_size = os.path.getsize(output_path) / (1024 ** 2)
     print(f'  피처 데이터: {output_path} ({file_size:.1f} MB)')
