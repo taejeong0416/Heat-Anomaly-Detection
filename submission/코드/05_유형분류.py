@@ -1,0 +1,837 @@
+"""
+Phase 6. 이상 유형 분류 및 결과 해석
+9유형 전부 규칙 기반으로 전체 데이터에 적용.
+is_anomaly==1이지만 어떤 규칙에도 해당하지 않는 행은 패턴이탈형(catch-all)으로 분류.
+SHAP 해석 + 결과 시각화를 수행한다.
+
+이상사용 유형 (분석플랜 5-1):
+  1) 급증형         : 전일 대비 변화율(ma7_ratio) 상위 + context_zscore 상위
+  2) 야간이상형      : night_ratio가 종별·월 그룹 평균 + 2σ 이상
+  3) 패턴이탈형      : gmm_log_likelihood 하위 N% OR ae_score 상위 N%
+  4) 장기미사용후급증형 : 활성시즌 내 zero_count ≥ N + ma7_ratio 상위
+  5) 계절역행형      : 비활성시즌 사용량 상위 N%
+  6) 주말이상형      : 업무용/공공용 & 주말·공휴일 & 사용량이 평일 수준 이상
+  7) 기저유량이상형  : baseload 종별·시즌 그룹 상위 N%
+
+냉수용은 활성시즌 정의를 반전(냉방시즌=활성).
+
+사용법:
+  python scripts/phase6_classification.py
+"""
+
+import pandas as pd
+import numpy as np
+import json
+import os
+import gc
+import time
+import pickle
+
+# ============================================================
+# 0. 설정
+# ============================================================
+HOUR_COLS = [f'{i}시' for i in range(1, 25)]
+HOUR_RATIO_COLS = [f'hour_ratio_{i}' for i in range(1, 25)]
+FACILITY_COL = '설치'
+DATE_COL = '날짜'
+
+PROCESSED_DIR = 'data/processed'
+FIG_DIR = 'outputs/figures'
+MODEL_DIR = 'outputs/phase5_models'
+PHASE6_DIR = 'outputs/phase6'
+
+TYPES = ['주택용', '업무용', '공공용', '냉수용']
+
+# Phase 5와 동일한 IF 입력 피처 (SHAP용)
+IF_FEATURES = (
+    HOUR_RATIO_COLS
+    + [
+        '총사용량',
+        'cv', 'hourly_std', 'peak_hour', 'baseload',
+        'night_ratio', 'day_ratio',
+        'ma7_ratio', 'ma30_ratio',
+        'autocorr_lag1', 'hour_diff_max', 'hour_diff_std',
+        'zero_count',
+        'context_zscore',
+    ]
+)
+
+# ============================================================
+# 유형 판정 임계
+# (2026-05-13 갱신: Phase 4 클러스터 검토 후 4-agent review 결과 반영)
+# ============================================================
+SURGE_MA7_QTILE = 0.90         # 급증형: ma7_ratio 상위 10%
+SURGE_Z_QTILE = 0.90           # 급증형: context_zscore 상위 10%
+
+# (G) 야간이상형 종별별 σ 차등:
+#   주택용은 새벽 가동(C0 클러스터 34.9%)이 정상이라 +3σ로 엄격화,
+#   나머지는 +2σ 유지. 종별별 정상 평균/표준편차는 df_all에서 산출.
+NIGHT_SIGMA_BY_TYPE = {
+    '주택용': 3.0,             # +3σ (정상 새벽 가동 회피)
+    '업무용': 2.0,
+    '공공용': 2.0,
+    '냉수용': 2.0,
+}
+NIGHT_APPLICABLE_TYPES = {'주택용', '업무용', '공공용', '냉수용'}  # (D)+(G) 전 종별 적용
+
+# (A)+(H) 패턴이탈형: AND 결합 유지, 임계는 1% → 5%로 완화 (fallback 적정 흡수)
+PATTERN_LL_QTILE = 0.05        # gmm_log_likelihood 하위 5%
+PATTERN_AE_QTILE = 0.95        # ae_score 상위 5%
+PATTERN_MP_QTILE = 0.95        # mp_score 상위 5%
+
+# (B) 장기미사용후급증형: 설비별 직전 7일 연속 무사용 후 다음날 급증
+LONG_NO_USE_DAYS = 7
+LONG_MA7_QTILE = 0.80          # ma7_ratio 상위 20%
+
+# (C) 계절역행형 종별별 임계: 주택용은 99% (엄격), 나머지 95%
+SEASON_REV_QTILE_BY_TYPE = {
+    '주택용': 0.99,
+    '업무용': 0.95,
+    '공공용': 0.95,
+    '냉수용': 0.95,
+}
+
+WEEKEND_RATIO = 0.8            # 주말·공휴일이 평일 수준 80% 이상
+BASELOAD_QTILE = 0.95          # 기저유량 상위 5%
+
+# (F) 신규 유형: 연속가동형(상시가동형)
+#   데이터 근거: Phase 4 주택용 C4 평탄 클러스터(41.6%)가 이미 정상으로 학습됨.
+#                그보다 더 평탄한 케이스는 분명한 이상 (분포 tail)
+#   도메인 근거: 보일러 상시 가동, HVAC 24시간 작동, 배관 누수 지속 유량
+#   규칙: hourly_std 종별·활성시즌 정상 5% 이하 AND baseload 80% 이상
+FLAT_STD_QTILE = 0.05          # hourly_std 종별·활성시즌 정상 하위 5%
+FLAT_BASELOAD_QTILE = 0.80     # baseload 종별·활성시즌 정상 상위 20%
+
+# (I) 신규 유형: 간헐사용형(비정형 사용 패턴)
+#   데이터 근거: Phase 6b 미분류 검토 — cv z=+2.01, hourly_std z=+1.09,
+#                ae_score z=+3.11 → 정상 형태에서 들쭉날쭉 벗어남
+#   도메인 근거: 열량계 간헐 결함, 비정형 거주 패턴, 급수 결함
+#   규칙: cv 종별·활성시즌 정상 상위 5% AND hourly_std 상위 5%
+INTERMITTENT_CV_QTILE = 0.95
+INTERMITTENT_STD_QTILE = 0.95
+
+REPRESENTATIVE_N = 5           # 유형별 대표 사례 수
+SHAP_SAMPLE = 1000             # SHAP 계산 샘플 (종별별)
+RANDOM_STATE = 42
+
+log = []
+
+
+def log_step(msg):
+    log.append(msg)
+    print(f'  → {msg}')
+
+
+# ============================================================
+# 1. 유형 분류 규칙
+# ============================================================
+
+def compute_long_no_use_surge(df, q_long_ma7):
+    """
+    (B) 장기미사용후급증형:
+      설비별 시계열에서 직전 7일 연속 총사용량=0 이후
+      당일 ma7_ratio가 q_long_ma7 이상이면 True.
+    """
+    tmp = df[[FACILITY_COL, DATE_COL, '총사용량']].copy()
+    tmp['_orig_pos'] = np.arange(len(tmp))
+    tmp = tmp.sort_values([FACILITY_COL, DATE_COL])
+    tmp['_rolling_sum_prev7'] = (
+        tmp.groupby(FACILITY_COL)['총사용량']
+        .transform(lambda s: s.shift(1).rolling(7, min_periods=7).sum())
+    )
+    # 원래 행 순서로 복원 (인덱스 값에 의존하지 않음)
+    tmp = tmp.sort_values('_orig_pos')
+    long_flag = (tmp['_rolling_sum_prev7'] == 0).fillna(False).values
+    return (
+        (df['활성시즌'] == True)
+        & long_flag
+        & (df['ma7_ratio'] >= q_long_ma7)
+    )
+
+
+def add_active_season(df):
+    """종별에 따라 활성시즌 컬럼 추가 (냉수용은 냉방시즌 반전 적용)."""
+    is_cold = df['종별'] == '냉수용'
+    df['활성시즌'] = np.where(
+        is_cold, df['냉방시즌'].astype(bool), df['난방시즌'].astype(bool)
+    )
+    return df
+
+
+def classify_types(df_all):
+    """
+    9유형 규칙 기반 분류.
+
+    9유형 전부 전체 데이터에 규칙 적용 (게이트 없음).
+    is_anomaly==1이면서 어떤 규칙에도 해당 없으면 catch-all 패턴이탈형.
+
+    Returns:
+      유형 배정된 행만 반환 (primary_type != '정상')
+    """
+    print('\n[유형 규칙 적용 — 9유형 전체 데이터]')
+    df_anom = df_all  # 전체 데이터 대상; merge 시 새 DataFrame 생성됨
+
+    # ── (그룹 통계: 종별·월 night_ratio 평균/표준편차, 정상 데이터만) ──
+    normal_mask = df_all['is_anomaly'] == 0
+    nr_stats = (
+        df_all[normal_mask].groupby(['종별', '월'], observed=True)['night_ratio']
+        .agg(['mean', 'std']).reset_index()
+        .rename(columns={'mean': 'nr_mean', 'std': 'nr_std'})
+    )
+    df_anom = df_anom.merge(nr_stats, on=['종별', '월'], how='left')
+
+    # ── (그룹 통계: 종별·활성시즌 baseload 95%분위, 정상 데이터만) ──
+    bl_q = (
+        df_all[normal_mask].groupby(['종별', '활성시즌'], observed=True)['baseload']
+        .quantile(BASELOAD_QTILE).reset_index()
+        .rename(columns={'baseload': 'bl_thr'})
+    )
+    df_anom = df_anom.merge(bl_q, on=['종별', '활성시즌'], how='left')
+
+    # ── (계절역행용 종별 임계는 SEASON_REV_QTILE_BY_TYPE로 아래에서 계산) ──
+
+    # ── 분위 기준: 전체 데이터 기반 (이상 샘플 내부가 아님) ──
+    q_ma7 = df_all['ma7_ratio'].quantile(SURGE_MA7_QTILE)
+    q_z = df_all['context_zscore'].abs().quantile(SURGE_Z_QTILE)
+    q_ll = df_all['gmm_log_likelihood'].quantile(PATTERN_LL_QTILE)
+    q_ae = df_all['ae_score'].quantile(PATTERN_AE_QTILE)
+    q_mp = df_all['mp_score'].quantile(PATTERN_MP_QTILE)
+    q_long_ma7 = df_all['ma7_ratio'].quantile(LONG_MA7_QTILE)
+
+    log_step(f'임계: ma7≥{q_ma7:.3f}, |z|≥{q_z:.2f}, '
+             f'logLL≤{q_ll:.2f}, ae≥{q_ae:.4f}, mp≥{q_mp:.4f}')
+
+    # ── 7개 유형 라벨 ──
+    df_anom['type_급증형'] = (
+        (df_anom['ma7_ratio'] >= q_ma7)
+        & (df_anom['context_zscore'].abs() >= q_z)
+    )
+
+    # (D)+(G) 야간이상형: 종별별 σ 차등 (주택용 +3σ, 나머지 +2σ)
+    sigma_per_row = (
+        df_anom['종별'].astype(str).map(NIGHT_SIGMA_BY_TYPE)
+        .fillna(2.0).astype(float).values
+    )
+    night_thr = df_anom['nr_mean'].values + sigma_per_row * df_anom['nr_std'].values
+    is_night_applicable = df_anom['종별'].isin(NIGHT_APPLICABLE_TYPES).values
+    df_anom['type_야간이상형'] = (
+        is_night_applicable
+        & (df_anom['night_ratio'].values >= night_thr)
+    )
+
+    # (A) 패턴이탈형: GMM log-likelihood 하위 AND AE/MP 상위 교집합
+    df_anom['type_패턴이탈형'] = (
+        (df_anom['gmm_log_likelihood'] <= q_ll)
+        & (
+            (df_anom['ae_score'] >= q_ae)
+            | (df_anom['mp_score'] >= q_mp)
+        )
+    )
+
+    # (B) 장기미사용후급증형 재정의:
+    #   "설비별 직전 7일 연속 총사용량=0 → 다음날 ma7_ratio 상위 20%"
+    #   기존 zero_count(24시간 중 0인 시간 수)는 의미 불일치였음.
+    df_anom['type_장기미사용후급증형'] = compute_long_no_use_surge(
+        df_anom, q_long_ma7,
+    )
+
+    # (C) 계절역행형: 종별별 분위 임계 차등
+    #   주택용은 절대 사용량이 작아 95%분위가 너무 느슨함 → 99%로 강화
+    season_thr_by_type = {}
+    for tname, qq in SEASON_REV_QTILE_BY_TYPE.items():
+        sub = df_all[(df_all['종별'] == tname) & (df_all['활성시즌'] == False)]
+        if len(sub):
+            season_thr_by_type[tname] = float(sub['총사용량'].quantile(qq))
+        else:
+            season_thr_by_type[tname] = np.inf
+    thr_per_row = (
+        df_anom['종별'].astype(str).map(season_thr_by_type)
+        .fillna(np.inf).astype(float).values
+    )
+    df_anom['type_계절역행형'] = (
+        (df_anom['활성시즌'] == False)
+        & (df_anom['총사용량'].values >= thr_per_row)
+    )
+    log_step('계절역행형 종별 임계: '
+             + ', '.join(f'{k}={v:.2f}' for k, v in season_thr_by_type.items()))
+
+    # ── 주말이상형: 업무용/공공용 주말 사용량이 정상 평일 중위수 수준 이상 ──
+    weekday_median = (
+        df_all[normal_mask
+               & df_all['종별'].isin(['업무용', '공공용'])
+               & (~df_all['is_weekend'].astype(bool))
+               & (~df_all['is_holiday'].astype(bool))]
+        .groupby(['종별', '월'], observed=True)['총사용량']
+        .median().reset_index()
+        .rename(columns={'총사용량': 'weekday_med'})
+    )
+    df_anom = df_anom.merge(weekday_median, on=['종별', '월'], how='left')
+
+    is_office_pub = df_anom['종별'].isin(['업무용', '공공용'])
+    is_off = (
+        (df_anom['is_weekend'].astype(bool))
+        | (df_anom['is_holiday'].astype(bool))
+    )
+    df_anom['type_주말이상형'] = (
+        is_office_pub & is_off
+        & (df_anom['총사용량'] >= df_anom['weekday_med'] * WEEKEND_RATIO)
+    )
+
+    df_anom['type_기저유량이상형'] = df_anom['baseload'] >= df_anom['bl_thr']
+
+    # (F) 신규 유형: 연속가동형
+    #   종별·활성시즌별 정상 hourly_std 5%분위와 baseload 80%분위 산출 후 결합
+    flat_std_q = (
+        df_all[normal_mask].groupby(['종별', '활성시즌'], observed=True)['hourly_std']
+        .quantile(FLAT_STD_QTILE).reset_index()
+        .rename(columns={'hourly_std': 'flat_std_thr'})
+    )
+    flat_bl_q = (
+        df_all[normal_mask].groupby(['종별', '활성시즌'], observed=True)['baseload']
+        .quantile(FLAT_BASELOAD_QTILE).reset_index()
+        .rename(columns={'baseload': 'flat_bl_thr'})
+    )
+    df_anom = df_anom.merge(flat_std_q, on=['종별', '활성시즌'], how='left')
+    df_anom = df_anom.merge(flat_bl_q, on=['종별', '활성시즌'], how='left')
+    df_anom['type_연속가동형'] = (
+        (df_anom['hourly_std'] <= df_anom['flat_std_thr'])
+        & (df_anom['baseload'] >= df_anom['flat_bl_thr'])
+    )
+    log_step('연속가동형 추가 (hourly_std 정상 하위 5% AND baseload 정상 상위 20%)')
+
+    # (I) 간헐사용형: cv·hourly_std 종별·활성시즌 정상 상위 5%
+    cv_q = (
+        df_all[normal_mask].groupby(['종별', '활성시즌'], observed=True)['cv']
+        .quantile(INTERMITTENT_CV_QTILE).reset_index()
+        .rename(columns={'cv': 'cv_thr'})
+    )
+    std_q = (
+        df_all[normal_mask].groupby(['종별', '활성시즌'], observed=True)['hourly_std']
+        .quantile(INTERMITTENT_STD_QTILE).reset_index()
+        .rename(columns={'hourly_std': 'std_thr'})
+    )
+    df_anom = df_anom.merge(cv_q, on=['종별', '활성시즌'], how='left')
+    df_anom = df_anom.merge(std_q, on=['종별', '활성시즌'], how='left')
+    df_anom['type_간헐사용형'] = (
+        (df_anom['cv'] >= df_anom['cv_thr'])
+        & (df_anom['hourly_std'] >= df_anom['std_thr'])
+    )
+    log_step('간헐사용형 추가 (cv 정상 상위 5% AND hourly_std 정상 상위 5%)')
+
+    type_cols = [c for c in df_anom.columns if c.startswith('type_')]
+
+    # ── 주 유형/보조 유형 ──
+    # (E) 우선순위 재정렬 (2026-05-13):
+    #   구체적 도메인 규칙 > 일반적 패턴 이상.
+    #   기존: 패턴이탈 1순위 → 70% 흡수되어 다른 유형 가려짐.
+    #   변경: 장기미사용·계절역행 (강한 규칙) → 야간·주말 (도메인) →
+    #         급증·기저 (값) → 패턴이탈 (fallback).
+    PRIORITY = [
+        'type_장기미사용후급증형',
+        'type_계절역행형',
+        'type_야간이상형',
+        'type_주말이상형',
+        'type_급증형',
+        'type_기저유량이상형',
+        'type_연속가동형',
+        'type_간헐사용형',
+        'type_패턴이탈형',
+    ]
+
+    # ── 벡터화된 primary_type 배정 (역순 우선순위 → 높은 우선순위가 덮어씀) ──
+    primary = pd.Series('정상', index=df_anom.index)
+    for c in reversed(PRIORITY):
+        mask = df_anom[c].astype(bool)
+        primary = primary.where(~mask, c.replace('type_', ''))
+
+    # Catch-all: is_anomaly==1이면서 어떤 규칙에도 미부합 → 패턴이탈형
+    no_type = (primary == '정상') & (df_anom['is_anomaly'] == 1)
+    primary[no_type] = '패턴이탈형'
+    df_anom['primary_type'] = primary
+
+    # ── secondary_types (다중 유형 행만 처리, 성능 최적화) ──
+    n_types = df_anom[type_cols].sum(axis=1)
+    df_anom['secondary_types'] = ''
+    multi = n_types > 1
+    if multi.any():
+        def pick_secondary(row):
+            prim = 'type_' + row['primary_type']
+            return ','.join(
+                c.replace('type_', '')
+                for c in type_cols if row.get(c, False) and c != prim
+            )
+        df_anom.loc[multi, 'secondary_types'] = (
+            df_anom.loc[multi].apply(pick_secondary, axis=1)
+        )
+
+    # ── 심각도 (0~1로 정규화된 IF score, 전체 데이터 기준) ──
+    if_valid = df_all['if_score'].dropna()
+    if_min = if_valid.min()
+    if_max = if_valid.max()
+    if if_max > if_min:
+        df_anom['severity'] = (
+            (df_anom['if_score'] - if_min) / (if_max - if_min)
+        ).clip(0, 1).astype(np.float32)
+    else:
+        df_anom['severity'] = np.float32(0.5)
+
+    # ── 이상 행만 필터 (정상 제외) ──
+    anom_result = df_anom[df_anom['primary_type'] != '정상'].copy()
+
+    # 통계 출력
+    counts = anom_result['primary_type'].value_counts()
+    print(f'\n  이상 유형 배정: {len(anom_result):,}행 '
+          f'(전체 {len(df_anom):,}행 중)')
+    for k, v in counts.items():
+        print(f'    {k}: {v:,} ({v/len(anom_result)*100:.1f}%)')
+
+    # 규칙 전용 탐지 비율 출력
+    n_rule_only = int((anom_result['is_anomaly'] == 0).sum())
+    n_model = int((anom_result['is_anomaly'] == 1).sum())
+    print(f'  (모델 탐지: {n_model:,}, 규칙 추가 탐지: {n_rule_only:,})')
+
+    return anom_result
+
+
+# ============================================================
+# 2. SHAP 해석
+# ============================================================
+
+def run_shap(df_all, type_dist_idx):
+    """
+    Phase 5 IF 모델에 SHAP 적용.
+    종별별로 (a) summary bar + (b) 유형별 대표 사례 waterfall 저장.
+    """
+    print('\n[SHAP 해석]')
+
+    try:
+        import shap
+    except ImportError:
+        log_step('SHAP 미설치 → 건너뜀 (pip install shap 필요)')
+        return {}
+
+    import matplotlib.pyplot as plt
+    plt.rcParams['font.family'] = 'Malgun Gothic'
+    plt.rcParams['axes.unicode_minus'] = False
+
+    shap_summary = {}
+    for type_name in TYPES:
+        model_path = os.path.join(MODEL_DIR, f'if_{type_name}.pkl')
+        scaler_path = os.path.join(MODEL_DIR, f'if_scaler_{type_name}.pkl')
+        if not (os.path.exists(model_path) and os.path.exists(scaler_path)):
+            print(f'  {type_name}: 모델 없음 → skip')
+            continue
+
+        with open(model_path, 'rb') as f:
+            model = pickle.load(f)
+        with open(scaler_path, 'rb') as f:
+            scaler = pickle.load(f)
+
+        mask = (df_all['종별'] == type_name) & (df_all['is_anomaly'] == 1)
+        if mask.sum() < 10:
+            continue
+
+        sub = df_all.loc[mask]
+        sample = sub.sample(
+            n=min(SHAP_SAMPLE, len(sub)), random_state=RANDOM_STATE
+        )
+        X_raw = sample[IF_FEATURES].fillna(0).values.astype(np.float32)
+        X = scaler.transform(X_raw).astype(np.float32)
+
+        print(f'  {type_name}: SHAP 계산 ({len(X):,}행)')
+        try:
+            explainer = shap.TreeExplainer(model)
+            shap_vals = explainer.shap_values(X)
+        except Exception as e:
+            print(f'    TreeExplainer 실패 ({e}), PermutationExplainer 시도')
+            try:
+                explainer = shap.PermutationExplainer(
+                    model.decision_function,
+                    X[:min(100, len(X))],
+                )
+                shap_vals = explainer(X).values
+            except Exception as e2:
+                print(f'    PermutationExplainer도 실패 ({e2}) → SHAP 스킵')
+                continue
+
+        # (a) summary bar
+        fig = plt.figure(figsize=(10, 6))
+        shap.summary_plot(
+            shap_vals, X, feature_names=IF_FEATURES,
+            plot_type='bar', show=False, max_display=15,
+        )
+        plt.title(f'{type_name} | IF SHAP feature importance')
+        plt.tight_layout()
+        plt.savefig(
+            os.path.join(FIG_DIR, f'phase06_shap_summary_{type_name}.png'),
+            dpi=150, bbox_inches='tight'
+        )
+        plt.close()
+
+        # 평균 |shap| 상위 5개 기록
+        mean_abs = np.abs(shap_vals).mean(axis=0)
+        order = np.argsort(mean_abs)[::-1][:10]
+        shap_summary[type_name] = [
+            {'feature': IF_FEATURES[i], 'mean_abs_shap': float(mean_abs[i])}
+            for i in order
+        ]
+
+        # (b) 유형별 대표 1건 waterfall
+        for ptype, rep_idx in type_dist_idx.get(type_name, {}).items():
+            if rep_idx is None or rep_idx not in sample.index:
+                # 인덱스 미일치 → 패스 (대표 사례가 sample에 없을 수 있음)
+                continue
+            pos = sample.index.get_loc(rep_idx)
+            try:
+                expl = shap.Explanation(
+                    values=shap_vals[pos],
+                    base_values=explainer.expected_value
+                    if np.isscalar(explainer.expected_value)
+                    else explainer.expected_value[0],
+                    data=X[pos],
+                    feature_names=IF_FEATURES,
+                )
+                fig = plt.figure(figsize=(10, 6))
+                shap.plots.waterfall(expl, show=False, max_display=12)
+                plt.title(f'{type_name} | {ptype} 대표 사례')
+                plt.tight_layout()
+                plt.savefig(
+                    os.path.join(
+                        FIG_DIR,
+                        f'phase06_shap_waterfall_{type_name}_{ptype}.png',
+                    ),
+                    dpi=150, bbox_inches='tight'
+                )
+                plt.close()
+            except Exception as e:
+                print(f'    waterfall 실패 ({type_name}/{ptype}): {e}')
+
+        del model, scaler, shap_vals, X, X_raw
+        gc.collect()
+
+    return shap_summary
+
+
+# ============================================================
+# 3. 결과 시각화
+# ============================================================
+
+def plot_type_pie(df_anom, save_path):
+    import matplotlib.pyplot as plt
+    plt.rcParams['font.family'] = 'Malgun Gothic'
+    plt.rcParams['axes.unicode_minus'] = False
+
+    counts = df_anom['primary_type'].value_counts()
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.pie(
+        counts.values, labels=counts.index,
+        autopct='%1.1f%%', startangle=90,
+        textprops={'fontsize': 10},
+    )
+    ax.set_title('이상 유형 분포 (주 유형)')
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+def plot_monthly_trend(df_anom, save_path):
+    import matplotlib.pyplot as plt
+    plt.rcParams['font.family'] = 'Malgun Gothic'
+    plt.rcParams['axes.unicode_minus'] = False
+
+    df_anom = df_anom.copy()
+    df_anom['연월'] = pd.to_datetime(df_anom[DATE_COL]).dt.to_period('M').astype(str)
+    monthly = (
+        df_anom.groupby(['연월', 'primary_type'], observed=True)
+        .size().unstack(fill_value=0)
+    )
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    monthly.plot(ax=ax, marker='o', markersize=3, linewidth=1.2)
+    ax.set_title('월별 이상 건수 추이 (유형별)')
+    ax.set_xlabel('연월')
+    ax.set_ylabel('건수')
+    ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=9)
+    ax.grid(True, alpha=0.3)
+    for tick in ax.get_xticklabels():
+        tick.set_rotation(45)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+def plot_branch_heatmap(df_anom, save_path):
+    import matplotlib.pyplot as plt
+    plt.rcParams['font.family'] = 'Malgun Gothic'
+    plt.rcParams['axes.unicode_minus'] = False
+
+    pivot = (
+        df_anom.groupby(['지사', '종별'], observed=True)
+        .size().unstack(fill_value=0)
+    )
+    # 행 정렬: 총 이상 건수 내림차순, 상위 30개
+    pivot = pivot.loc[pivot.sum(axis=1).sort_values(ascending=False).index]
+    pivot = pivot.head(30)
+
+    fig, ax = plt.subplots(figsize=(8, max(6, len(pivot) * 0.3)))
+    im = ax.imshow(pivot.values, aspect='auto', cmap='YlOrRd')
+    ax.set_xticks(range(len(pivot.columns)))
+    ax.set_xticklabels(pivot.columns)
+    ax.set_yticks(range(len(pivot.index)))
+    ax.set_yticklabels(pivot.index, fontsize=8)
+    ax.set_title('지사·종별 이상 빈도 (상위 30 지사)')
+    fig.colorbar(im, ax=ax, label='이상 건수')
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+def plot_representative_cases(df_anom, df_all, save_dir):
+    """유형별 대표 사례의 24시간 사용량 곡선 + 정상 패턴 오버레이."""
+    import matplotlib.pyplot as plt
+    plt.rcParams['font.family'] = 'Malgun Gothic'
+    plt.rcParams['axes.unicode_minus'] = False
+
+    rep_index = {t: {} for t in TYPES}
+
+    for ptype, sub in df_anom.groupby('primary_type', observed=True):
+        if ptype == '미분류':
+            continue
+        # 심각도 상위 N건
+        top = sub.nlargest(REPRESENTATIVE_N, 'severity')
+        for rank, (_, row) in enumerate(top.iterrows(), 1):
+            type_name = row['종별']
+            # 정상 평균 곡선 (종별·활성시즌)
+            mask_norm = (
+                (df_all['종별'] == type_name)
+                & (df_all['활성시즌'] == row['활성시즌'])
+                & (df_all['is_anomaly'] == 0)
+            )
+            normal_mean = df_all.loc[mask_norm, HOUR_COLS].mean()
+
+            fig, ax = plt.subplots(figsize=(11, 5))
+            hours = list(range(1, 25))
+            ax.plot(hours, row[HOUR_COLS].values, 'o-',
+                    color='#E53935', linewidth=2,
+                    label=f'이상 ({row[DATE_COL]})')
+            ax.plot(hours, normal_mean.values, '--',
+                    color='#1E88E5', linewidth=1.5,
+                    label='정상 평균')
+            ax.set_xlabel('시간')
+            ax.set_ylabel('사용량 (Gcal)')
+            ax.set_title(
+                f'{ptype} | {type_name} | {row[FACILITY_COL]} '
+                f'(severity={row["severity"]:.2f})'
+            )
+            ax.legend()
+            ax.set_xticks(hours)
+            ax.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.savefig(
+                os.path.join(
+                    save_dir, f'phase06_case_{ptype}_{rank}.png'
+                ),
+                dpi=150, bbox_inches='tight'
+            )
+            plt.close()
+
+            # SHAP 매핑용 대표 인덱스 (rank=1)만 저장
+            if rank == 1 and type_name in rep_index:
+                rep_index[type_name][ptype] = row.name
+
+    return rep_index
+
+
+# ============================================================
+# 4. 메인 파이프라인
+# ============================================================
+
+def run():
+    t_start = time.time()
+
+    print('=' * 60)
+    print('Phase 6. 이상 유형 분류 및 결과 해석')
+    print('=' * 60)
+
+    os.makedirs(FIG_DIR, exist_ok=True)
+    os.makedirs(PHASE6_DIR, exist_ok=True)
+
+    # ── 데이터 로드 ──
+    print('\n[데이터 로드]')
+    input_path = f'{PROCESSED_DIR}/features.parquet'
+
+    import pyarrow.parquet as pq
+    _table = pq.read_table(input_path)
+    df_all = _table.to_pandas(self_destruct=True)
+    del _table
+    gc.collect()
+
+    df_all[DATE_COL] = pd.to_datetime(df_all[DATE_COL])
+
+    # ── 입력 데이터 검증 ──
+    required = [
+        'is_anomaly', 'if_score', 'ae_score', 'mp_score',
+        'gmm_log_likelihood', 'context_zscore',
+        'is_weekend', 'is_holiday', '난방시즌', '냉방시즌',
+        'night_ratio', 'baseload', 'ma7_ratio', 'zero_count',
+    ]
+    missing = [c for c in required if c not in df_all.columns]
+    if missing:
+        raise RuntimeError(
+            f'Phase 5 산출물 컬럼 누락: {missing}. '
+            f'Phase 5 (scripts/phase5_anomaly_detection.py) 실행 후 재시도.'
+        )
+
+    df_all = add_active_season(df_all)
+    print(f'  전체: {len(df_all):,}행, {len(df_all.columns)}개 컬럼')
+
+    # ── 9유형 규칙 기반 분류 ──
+    n_model_anom = int((df_all['is_anomaly'] == 1).sum())
+    print(f'  Phase 5 모델 이상: {n_model_anom:,}행 '
+          f'({n_model_anom/len(df_all)*100:.2f}%)')
+
+    df_anom = classify_types(df_all)
+    log_step(f'유형 분류 완료: {len(df_anom):,}행')
+
+    if len(df_anom) == 0:
+        print('  이상 샘플이 없습니다.')
+        return
+
+    # ── 시각화 ──
+    print('\n[시각화]')
+    plot_type_pie(
+        df_anom, os.path.join(FIG_DIR, 'phase06_type_pie.png')
+    )
+    plot_monthly_trend(
+        df_anom, os.path.join(FIG_DIR, 'phase06_monthly_trend.png')
+    )
+    plot_branch_heatmap(
+        df_anom, os.path.join(FIG_DIR, 'phase06_branch_heatmap.png')
+    )
+
+    # 대표 사례 (rep_index는 SHAP waterfall에서 재사용)
+    rep_index = plot_representative_cases(df_anom, df_all, FIG_DIR)
+    log_step('파이/월별/지사·종별/대표사례 시각화 완료')
+
+    # ── SHAP ──
+    shap_summary = run_shap(df_all, rep_index)
+    if shap_summary:
+        log_step(f'SHAP 완료: {len(shap_summary)}개 종별')
+
+    # ── 검증용 샘플 (유형별 10건) ──
+    review_rows = []
+    for ptype, sub in df_anom.groupby('primary_type', observed=True):
+        if ptype == '미분류':
+            continue
+        review_rows.append(
+            sub.nlargest(10, 'severity')
+        )
+    if review_rows:
+        review_df = pd.concat(review_rows, ignore_index=True)
+        review_path = os.path.join(PHASE6_DIR, 'manual_review_samples.csv')
+        review_cols = [
+            FACILITY_COL, DATE_COL, '종별', '지사', '총사용량',
+            'primary_type', 'secondary_types', 'severity',
+            'if_score', 'ae_score', 'mp_score',
+            'gmm_log_likelihood', 'context_zscore',
+        ]
+        review_cols = [c for c in review_cols if c in review_df.columns]
+        review_df[review_cols].to_csv(
+            review_path, index=False, encoding='utf-8-sig'
+        )
+        print(f'  수동 검토 샘플: {review_path} ({len(review_df)}건)')
+
+    # ── 저장 ──
+    print('\n[저장]')
+
+    # 1) 유형 분류 결과 테이블 (분석플랜 6-5 산출물)
+    out_cols = [
+        FACILITY_COL, DATE_COL, '종별', '지사', '월', '요일',
+        '난방시즌', '냉방시즌', '활성시즌',
+        '총사용량',
+        'if_score', 'if_flag', 'ae_score', 'ae_flag',
+        'mp_score', 'mp_flag',
+        'gmm_log_likelihood', 'context_zscore',
+        'stat_zscore_flag', 'stat_iqr_flag',
+        'anomaly_confidence', 'is_anomaly',
+        'primary_type', 'secondary_types', 'severity',
+    ]
+    type_cols = [c for c in df_anom.columns if c.startswith('type_')]
+    out_cols = [c for c in out_cols if c in df_anom.columns] + type_cols
+
+    classified_path = f'{PROCESSED_DIR}/anomaly_classified.parquet'
+    df_anom[out_cols].to_parquet(classified_path, index=False)
+    size_mb = os.path.getsize(classified_path) / (1024 ** 2)
+    print(f'  유형 분류 결과: {classified_path} '
+          f'({len(df_anom):,}행, {size_mb:.1f} MB)')
+
+    # 2) 유형별 분포 CSV
+    type_counts = (
+        df_anom.groupby(['종별', 'primary_type'], observed=True)
+        .size().unstack(fill_value=0)
+    )
+    type_counts['전체'] = type_counts.sum(axis=1)
+    counts_path = os.path.join(PHASE6_DIR, 'type_distribution.csv')
+    type_counts.to_csv(counts_path, encoding='utf-8-sig')
+    print(f'  유형 분포: {counts_path}')
+
+    # 3) Phase 6 요약 JSON
+    summary = {
+        'anomaly_rows': int(len(df_anom)),
+        'classified_columns': out_cols,
+        'thresholds': {
+            'SURGE_MA7_QTILE': SURGE_MA7_QTILE,
+            'SURGE_Z_QTILE': SURGE_Z_QTILE,
+            'NIGHT_SIGMA_BY_TYPE': NIGHT_SIGMA_BY_TYPE,
+            'NIGHT_APPLICABLE_TYPES': sorted(NIGHT_APPLICABLE_TYPES),
+            'PATTERN_LL_QTILE': PATTERN_LL_QTILE,
+            'PATTERN_AE_QTILE': PATTERN_AE_QTILE,
+            'PATTERN_MP_QTILE': PATTERN_MP_QTILE,
+            'PATTERN_RULE': 'gmm_ll<=q AND (ae>=q OR mp>=q)',
+            'LONG_NO_USE_DAYS': LONG_NO_USE_DAYS,
+            'LONG_NO_USE_RULE': 'prev 7 days all 총사용량=0 (시계열)',
+            'LONG_MA7_QTILE': LONG_MA7_QTILE,
+            'SEASON_REV_QTILE_BY_TYPE': SEASON_REV_QTILE_BY_TYPE,
+            'WEEKEND_RATIO': WEEKEND_RATIO,
+            'BASELOAD_QTILE': BASELOAD_QTILE,
+            'FLAT_STD_QTILE': FLAT_STD_QTILE,
+            'FLAT_BASELOAD_QTILE': FLAT_BASELOAD_QTILE,
+            'FLAT_RULE': 'hourly_std<=정상 q5 AND baseload>=정상 q80',
+            'INTERMITTENT_CV_QTILE': INTERMITTENT_CV_QTILE,
+            'INTERMITTENT_STD_QTILE': INTERMITTENT_STD_QTILE,
+            'INTERMITTENT_RULE': 'cv>=정상 q95 AND hourly_std>=정상 q95',
+            'PATTERN_OUTLIER_FALLBACK': '구체 유형 미부합 시 catch-all로 패턴이탈형',
+            'PRIORITY_ORDER': [
+                '장기미사용후급증형', '계절역행형', '야간이상형', '주말이상형',
+                '급증형', '기저유량이상형', '연속가동형', '간헐사용형',
+                '패턴이탈형(fallback)',
+            ],
+        },
+        'primary_type_counts': {
+            k: int(v)
+            for k, v in df_anom['primary_type'].value_counts().items()
+        },
+        'shap_top_features': shap_summary,
+        'log': log,
+    }
+    summary_path = f'{PROCESSED_DIR}/phase6_summary.json'
+    with open(summary_path, 'w', encoding='utf-8') as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+    print(f'  요약: {summary_path}')
+
+    # ── 최종 ──
+    elapsed = time.time() - t_start
+    print(f'\n{"=" * 60}')
+    print(f'Phase 6 완료! ({elapsed:.1f}초)')
+    print(f'{"=" * 60}')
+    for entry in log:
+        print(f'  {entry}')
+    print(f'\n  출력: {classified_path}')
+
+
+# ============================================================
+# CLI
+# ============================================================
+
+if __name__ == '__main__':
+    run()
