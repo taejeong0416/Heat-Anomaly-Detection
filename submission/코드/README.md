@@ -14,10 +14,10 @@ pip install pandas numpy scikit-learn torch stumpy shap matplotlib pyarrow
 ```bash
 python 01_전처리.py          # 원본 CSV → 정제 데이터 (PNNL 기반 9단계 품질 파이프라인)
 python 02_피처생성.py        # 38개 분석 피처 생성 (시간 패턴, 추세, 통계량)
-python 03_정��패턴모델링.py   # GMM 정상 패턴 클러스터링 + 그룹 내 Z-score 산출
+python 03_정상패턴모델링.py   # GMM 정상 패턴 클러스터링 + 그룹 내 Z-score 산출
 python 04_이상탐지.py        # 4중 앙상블 이상 탐지 (IF + AE + Matrix Profile + 통계)
 python 05_유형분류.py        # 9유형 규칙 기반 분류 + SHAP 해석
-python 06_성���평가.py        # 합성 이상 주입 정량 평가 (vs 전년대비 ±30% 베이스라인)
+python 06_성능평가.py        # 합성 이상 주입 정량 평가 (vs 전년대비 ±30% 베이스라인)
 ```
 
 ## 입출력 데이터
@@ -33,7 +33,7 @@ python 06_성���평가.py        # 합성 이상 주입 정량 평가 (vs 
 
 ```
 [01 전처리] 원본 1,687만행 → 품질 검증 → 1,665만행 (98.7% 유지)
-     ��
+     ↓
 [02 피처] 시간대별 비율, 변동계수, 이동평균 비율, 자기상관 등 38개 피처
      ↓
 [03 정상패턴] GMM으로 종별×시즌 8그룹 정상 클러스터 학습
