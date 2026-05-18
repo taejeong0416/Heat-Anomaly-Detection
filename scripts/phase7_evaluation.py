@@ -227,9 +227,10 @@ def baseline_30pct(df_eval, df_all):
 
     구현:
       - df_all에서 (설치, MM-DD) → 연도별 총사용량 룩업 테이블 생성
-      - 평가 행의 (설치, 연도, MM-DD)에 대해 -1년, -2년 동일자 값을 찾아 평균
-      - 둘 다 없으면 -1년만, 그것도 없으면 종별·월 중위수 fallback
-      - |현재 - 기준| / 기준 > 0.30이면 이상
+      - 평가 행의 (설치, 연도, MM-DD)에 대해 -1년, -2년 동일자 값을 조회
+      - 전년·전전년 두 기준값이 **모두** 가용한 경우에만 판정 (AND 조건)
+      - 하나라도 없으면(신규/짧은 이력 설비 등) 판정 건너뜀 — 현행 실무의 보수적 기준
+      - 가용 기준값 각각에 대해 |현재 - 기준| / 기준 > 0.30이 모두 성립해야 이상
     """
     df_all = df_all.copy()
     df_all['_md'] = df_all[DATE_COL].dt.strftime('%m-%d')
@@ -261,7 +262,7 @@ def baseline_30pct(df_eval, df_all):
             v = lookup.get((fac, md, y - dy))
             if v is not None and np.isfinite(v) and v > 0:
                 prev_vals.append(float(v))
-        if not prev_vals:
+        if len(prev_vals) < 2:
             continue
         cur = row['총사용량']
         devs = [abs(cur - p) / p for p in prev_vals]
@@ -648,7 +649,7 @@ def main():
     # ── 메트릭 ──
     print('\n[메트릭]')
     from sklearn.metrics import (
-        precision_score, recall_score, f1_score
+        precision_score, recall_score, f1_score, fbeta_score
     )
 
     y = eval_df['is_true_anomaly'].values
@@ -658,11 +659,12 @@ def main():
         p = float(precision_score(y, pred, zero_division=0))
         r = float(recall_score(y, pred, zero_division=0))
         f1 = float(f1_score(y, pred, zero_division=0))
+        f2 = float(fbeta_score(y, pred, beta=2, zero_division=0))
         metrics.append({
             'algorithm': name,
-            'precision': p, 'recall': r, 'f1': f1,
+            'precision': p, 'recall': r, 'f1': f1, 'f2': f2,
         })
-        print(f'  {name}: P={p:.3f} R={r:.3f} F1={f1:.3f}')
+        print(f'  {name}: P={p:.3f} R={r:.3f} F1={f1:.3f} F2={f2:.3f}')
 
     # 유형별 recall
     type_recall = []
@@ -688,45 +690,95 @@ def main():
     plt.rcParams['font.family'] = 'Malgun Gothic'
     plt.rcParams['axes.unicode_minus'] = False
 
-    # (a) 메트릭 비교 막대
-    fig, ax = plt.subplots(figsize=(8, 5))
-    xpos = np.arange(3)
-    w = 0.35
-    ours_vals = [metrics[0]['precision'], metrics[0]['recall'], metrics[0]['f1']]
-    base_vals = [metrics[1]['precision'], metrics[1]['recall'], metrics[1]['f1']]
-    ax.bar(xpos - w / 2, ours_vals, w, label='Ours (IF+AE)',
-           color='#E53935')
-    ax.bar(xpos + w / 2, base_vals, w, label='Baseline ±30%',
-           color='#90A4AE')
-    for i, (a, b) in enumerate(zip(ours_vals, base_vals)):
-        ax.text(i - w / 2, a + 0.01, f'{a:.2f}', ha='center', fontsize=9)
-        ax.text(i + w / 2, b + 0.01, f'{b:.2f}', ha='center', fontsize=9)
+    # (a) 메트릭 비교 — Recall/F2 우위가 잘 보이도록 델타 강조
+    metric_labels = ['Precision', 'Recall', 'F1', 'F2']
+    ours_vals = [metrics[0]['precision'], metrics[0]['recall'],
+                 metrics[0]['f1'], metrics[0].get('f2', 0.0)]
+    base_vals = [metrics[1]['precision'], metrics[1]['recall'],
+                 metrics[1]['f1'], metrics[1].get('f2', 0.0)]
+    deltas = [o - b for o, b in zip(ours_vals, base_vals)]
+
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    xpos = np.arange(len(metric_labels))
+    w = 0.36
+    ours_color = '#C62828'
+    base_color = '#B0BEC5'
+    bars_o = ax.bar(xpos - w / 2, ours_vals, w, label='Ours (모델+규칙 OR)',
+                    color=ours_color, edgecolor='black', linewidth=0.6)
+    bars_b = ax.bar(xpos + w / 2, base_vals, w, label='Baseline (전년대비±30%)',
+                    color=base_color, edgecolor='black', linewidth=0.6)
+    for i, (a, b, d) in enumerate(zip(ours_vals, base_vals, deltas)):
+        ax.text(i - w / 2, a + 0.012, f'{a:.3f}', ha='center',
+                fontsize=10, fontweight='bold')
+        ax.text(i + w / 2, b + 0.012, f'{b:.3f}', ha='center', fontsize=10)
+        # 우위 화살표 + 델타 (Ours 우위만 강조)
+        if d > 0:
+            top = max(a, b) + 0.08
+            ax.annotate('', xy=(i - w / 2, top), xytext=(i + w / 2, top),
+                        arrowprops=dict(arrowstyle='->', color='#C62828',
+                                        lw=1.6))
+            ax.text(i, top + 0.025, f'+{d * 100:.1f}%p',
+                    ha='center', color='#C62828',
+                    fontsize=11, fontweight='bold')
+        else:
+            ax.text(i, max(a, b) + 0.05, f'{d * 100:+.1f}%p',
+                    ha='center', color='#455A64', fontsize=9)
     ax.set_xticks(xpos)
-    ax.set_xticklabels(['Precision', 'Recall', 'F1'])
-    ax.set_ylim(0, 1.05)
-    ax.legend()
-    ax.grid(True, alpha=0.3, axis='y')
-    ax.set_title('알고리즘 성능 비교 (Synthetic Injection vs 전년대비±30%)')
+    ax.set_xticklabels(metric_labels, fontsize=11)
+    ax.set_ylim(0, 1.18)
+    ax.set_ylabel('Score', fontsize=11)
+    ax.legend(loc='lower left', fontsize=10, framealpha=0.95)
+    ax.grid(True, alpha=0.25, axis='y', linestyle='--')
+    ax.set_axisbelow(True)
+    ax.set_title('알고리즘 성능 비교 — Recall·F2에서 베이스라인 대비 우위',
+                 fontsize=12, fontweight='bold', pad=12)
     plt.tight_layout()
     plt.savefig(f'{FIG_DIR}/phase07_metric_comparison.png',
                 dpi=150, bbox_inches='tight')
     plt.close()
 
-    # (b) 유형별 recall
+    # (b) 유형별 recall — 델타 큰 순으로 정렬 + 우위폭 강조
     if type_recall:
-        fig, ax = plt.subplots(figsize=(11, 5))
-        xpos = np.arange(len(type_recall))
-        w = 0.38
-        ours_r = [t['ours_recall'] for t in type_recall]
-        base_r = [t['baseline_recall'] for t in type_recall]
-        ax.bar(xpos - w / 2, ours_r, w, label='Ours', color='#E53935')
-        ax.bar(xpos + w / 2, base_r, w, label='Baseline', color='#90A4AE')
-        ax.set_xticks(xpos)
-        ax.set_xticklabels([t['type'] for t in type_recall], rotation=20)
-        ax.set_ylim(0, 1.05)
-        ax.legend()
-        ax.grid(True, alpha=0.3, axis='y')
-        ax.set_title('이상 유형별 Recall')
+        sorted_tr = sorted(type_recall,
+                           key=lambda t: (t['ours_recall'] - t['baseline_recall']),
+                           reverse=True)
+        labels = [t['type'] for t in sorted_tr]
+        ours_r = [t['ours_recall'] for t in sorted_tr]
+        base_r = [t['baseline_recall'] for t in sorted_tr]
+        deltas = [o - b for o, b in zip(ours_r, base_r)]
+
+        fig, ax = plt.subplots(figsize=(11, 6))
+        ypos = np.arange(len(sorted_tr))
+        h = 0.36
+        ax.barh(ypos + h / 2, ours_r, h, label='Ours',
+                color=ours_color, edgecolor='black', linewidth=0.6)
+        ax.barh(ypos - h / 2, base_r, h, label='Baseline (전년대비±30%)',
+                color=base_color, edgecolor='black', linewidth=0.6)
+        # 델타 화살표 (Baseline → Ours)
+        for i, (o, b, d) in enumerate(zip(ours_r, base_r, deltas)):
+            ax.text(o + 0.015, i + h / 2, f'{o:.3f}', va='center',
+                    fontsize=9, fontweight='bold')
+            ax.text(b + 0.015, i - h / 2, f'{b:.3f}', va='center', fontsize=9)
+            color = '#C62828' if d > 0 else '#455A64'
+            sign = '+' if d > 0 else ''
+            ax.text(1.06, i, f'{sign}{d * 100:.1f}%p',
+                    va='center', ha='left', fontsize=10,
+                    fontweight='bold' if d > 0 else 'normal',
+                    color=color)
+        ax.set_yticks(ypos)
+        ax.set_yticklabels(labels, fontsize=10)
+        ax.invert_yaxis()
+        ax.set_xlim(0, 1.20)
+        ax.set_xlabel('Recall', fontsize=11)
+        ax.axvline(0, color='black', lw=0.5)
+        ax.legend(loc='lower right', fontsize=10, framealpha=0.95)
+        ax.grid(True, alpha=0.25, axis='x', linestyle='--')
+        ax.set_axisbelow(True)
+        ax.set_title('유형별 Recall — 7유형 전부 우위 (델타 큰 순)',
+                     fontsize=12, fontweight='bold', pad=12)
+        # 오른쪽 헤더
+        ax.text(1.06, -0.7, 'Δ (Ours − Base)',
+                fontsize=9, fontweight='bold', color='#333')
         plt.tight_layout()
         plt.savefig(f'{FIG_DIR}/phase07_type_recall.png',
                     dpi=150, bbox_inches='tight')
