@@ -5,59 +5,59 @@
   "metrics": [
     {
       "algorithm": "Ours",
-      "precision": 0.6384760875439071,
-      "recall": 0.9088461538461539,
-      "f1": 0.7500396762418664
+      "precision": 0.6388289260658392,
+      "recall": 0.9105769230769231,
+      "f1": 0.750872185220425
     },
     {
       "algorithm": "Baseline_전년대비±30%",
-      "precision": 0.6889273901401796,
-      "recall": 0.8411538461538461,
-      "f1": 0.7574681790631224
+      "precision": 0.690472428503713,
+      "recall": 0.8403846153846154,
+      "f1": 0.7580882990719057
     }
   ],
   "type_recall": [
     {
       "type": "급증형",
       "n": 800,
-      "ours_recall": 0.88875,
-      "baseline_recall": 0.95875
+      "ours_recall": 0.88375,
+      "baseline_recall": 0.9425
     },
     {
       "type": "야간이상형",
       "n": 800,
       "ours_recall": 1.0,
-      "baseline_recall": 0.95875
+      "baseline_recall": 0.97
     },
     {
       "type": "패턴이탈형",
       "n": 800,
-      "ours_recall": 0.71,
-      "baseline_recall": 0.5
+      "ours_recall": 0.69125,
+      "baseline_recall": 0.47625
     },
     {
       "type": "장기미사용후급증형",
       "n": 800,
-      "ours_recall": 0.95375,
+      "ours_recall": 0.9525,
       "baseline_recall": 0.705
     },
     {
       "type": "계절역행형",
       "n": 800,
-      "ours_recall": 0.98625,
-      "baseline_recall": 0.92875
+      "ours_recall": 0.9925,
+      "baseline_recall": 0.94375
     },
     {
       "type": "주말이상형",
       "n": 400,
-      "ours_recall": 0.9425,
-      "baseline_recall": 0.905
+      "ours_recall": 0.9525,
+      "baseline_recall": 0.9
     },
     {
       "type": "기저유량이상형",
       "n": 800,
-      "ours_recall": 0.8975,
-      "baseline_recall": 0.96375
+      "ours_recall": 0.9225,
+      "baseline_recall": 0.975
     }
   ],
   "config": {
