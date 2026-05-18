@@ -260,16 +260,12 @@ def baseline_30pct(df_eval, df_all):
         for dy in (1, 2):
             v = lookup.get((fac, md, y - dy))
             if v is not None and np.isfinite(v) and v > 0:
-                prev_vals.append(v)
-        if prev_vals:
-            ref = float(np.mean(prev_vals))
-        else:
-            v = fb.get((row['종별'], int(row['월'])))
-            ref = float(v) if v is not None and np.isfinite(v) and v > 0 else np.nan
-        if not np.isfinite(ref) or ref <= 0:
+                prev_vals.append(float(v))
+        if not prev_vals:
             continue
-        dev = abs(row['총사용량'] - ref) / ref
-        if dev > 0.30:
+        cur = row['총사용량']
+        devs = [abs(cur - p) / p for p in prev_vals]
+        if all(d > 0.30 for d in devs):
             flags[i] = 1
     return flags
 
