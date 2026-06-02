@@ -1,10 +1,10 @@
 """
-Phase 4. 정상 패턴 모델링
+Phase 3. 정상 패턴 모델링
 GMM(Gaussian Mixture Model)으로 종별×시즌별 정상 패턴 프로토타입을 정의하고,
 log-likelihood를 이상 점수로, Context Z-score를 횡단면 비교 피처로 생성한다.
 
 사용법:
-  python scripts/phase4_normal_pattern.py
+  python scripts/phase3_normal_pattern.py
 """
 
 import pandas as pd

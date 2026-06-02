@@ -1,6 +1,6 @@
 """
-Phase 5. 이상 탐지
-Phase 4의 정상 패턴 모델 출력(gmm_log_likelihood, context_zscore, cluster_id)에
+Phase 4. 이상 탐지
+Phase 3의 정상 패턴 모델 출력(gmm_log_likelihood, context_zscore, cluster_id)에
 Isolation Forest + Autoencoder + Matrix Profile + 통계 기반 보조 탐지를 결합하여
 설비-일 단위 anomaly score와 이상 여부 라벨을 산출한다.
 
@@ -9,19 +9,19 @@ Isolation Forest + Autoencoder + Matrix Profile + 통계 기반 보조 탐지를
   Hinton & Salakhutdinov (2006), Sakurada & Yairi (2014) — Autoencoder 이상 탐지
   Yeh et al. (2016) — Matrix Profile (시계열 자기 참조 이상 탐지)
   PNNL-24331 (2015) — z-score / IQR 기반 보조 필터
-  도메인조사.md §5 — 이상 7유형 (Phase 5-1)
+  도메인조사.md §5 — 이상 7유형
 
 설계 결정:
   - 스케일러: heavy-tailed 분포(총사용량, log-likelihood 등)에 강건한
     RobustScaler(median/IQR) 사용. StandardScaler는 극단값 영향으로
     일반 행이 0 근처로 압축되어 부적절.
-  - 임계 선정: 라벨이 없으므로 Phase 4의 GMM log-likelihood 하위 q%
+  - 임계 선정: 라벨이 없으므로 Phase 3의 GMM log-likelihood 하위 q%
     를 약 라벨(weak label)로 사용하여 F1 최대화 하는 후보를 선택한다.
     GMM은 본 프로젝트의 "정상 패턴 프로토타입"이므로 도메인적으로
-    합리적인 reference. 선정 결과는 phase5_summary.json에 기록.
+    합리적인 reference. 선정 결과는 phase4_summary.json에 기록.
 
 사용법:
-  python scripts/phase5_anomaly_detection.py
+  python 04_이상탐지.py
 """
 
 import pandas as pd

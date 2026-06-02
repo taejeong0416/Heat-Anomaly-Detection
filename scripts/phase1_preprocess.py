@@ -1,13 +1,13 @@
 """
-Phase 2. 정밀 전처리 파이프라인 (통합)
+Phase 1. 정밀 전처리 파이프라인 (통합)
 PNNL-24331 (2015) + Quesada et al. (2024) + 데이터 분포 분석 기반
 
 9단계 전처리 + 근거 분석 시각화 코드 통합
 
 사용법:
-  python scripts/phase2_preprocess.py              # 전처리 실행
-  python scripts/phase2_preprocess.py --analyze     # 근거 분석만 실행 (시각화)
-  python scripts/phase2_preprocess.py --all         # 근거 분석 + 전처리 모두
+  python scripts/phase1_preprocess.py              # 전처리 실행
+  python scripts/phase1_preprocess.py --analyze     # 근거 분석만 실행 (시각화)
+  python scripts/phase1_preprocess.py --all         # 근거 분석 + 전처리 모두
 """
 
 import pandas as pd

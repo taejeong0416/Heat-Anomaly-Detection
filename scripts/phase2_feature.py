@@ -1,5 +1,5 @@
 """
-Phase 3. Feature Engineering
+Phase 2. Feature Engineering
 이상 탐지 모델을 위한 피처 엔지니어링
 
 학술 근거:
@@ -11,7 +11,7 @@ Phase 3. Feature Engineering
   PNNL (2015) — zero consumption
 
 사용법:
-  python scripts/phase3_feature.py
+  python scripts/phase2_feature.py
 """
 
 import pandas as pd

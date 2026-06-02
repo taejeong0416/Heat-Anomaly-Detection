@@ -27,7 +27,7 @@ python 06_성능평가.py        # 합성 이상 주입 정량 평가 (vs 전년
 | 입력 | `data/raw/{연도}/` | 월별 gzip CSV (60개 파일, 2021~2025) |
 | 중간 | `data/processed/features.parquet` | 전처리+피처+탐지 결과 누적 (단일 파일) |
 | 결과 | `data/processed/anomaly_classified.parquet` | 이상 행 + 유형 분류 결과 |
-| 평가 | `outputs/phase7/phase7_summary.json` | 최종 성능 지표 |
+| 평가 | `outputs/phase6/phase6_summary.json` | 최종 성능 지표 |
 
 ## 알고리즘 개요
 

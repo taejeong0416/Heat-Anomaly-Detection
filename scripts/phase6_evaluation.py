@@ -1,17 +1,17 @@
 """
-Phase 7. 알고리즘 성능 평가
+Phase 6. 알고리즘 성능 평가
 비지도 환경에서 ground truth가 없으므로 아래 3개 방법으로 정량 비교한다.
 
   (1) Synthetic Anomaly Injection
       정상 행에 7유형 이상을 인위적으로 주입하여 ground truth 라벨 확보.
-      우리 알고리즘(Phase 5 IF + AE) vs 베이스라인(±30% 룰)의
+      우리 알고리즘(Phase 4 IF + AE) vs 베이스라인(±30% 룰)의
       Precision / Recall / F1 / 유형별 Recall 비교.
 
   (2) 정성 비교 표
       탐지 가능 유형 수, 컨텍스트 반영, 해석 가능성 등 차원별 비교.
 
   (3) 수동 검토 표본 (stratified 50건)
-      Phase 6 분류 결과에서 유형별로 7건씩 추출하여 도메인 전문가
+      Phase 5 분류 결과에서 유형별로 7건씩 추출하여 도메인 전문가
       재검토용 CSV 생성.
 
 한계 (보고서에 명시):
@@ -21,7 +21,7 @@ Phase 7. 알고리즘 성능 평가
   - 임계는 학습 단계와 동일(contamination 0.02 등) 가정.
 
 사용법:
-  python scripts/phase7_evaluation.py
+  python scripts/phase6_evaluation.py
 """
 
 import pandas as pd

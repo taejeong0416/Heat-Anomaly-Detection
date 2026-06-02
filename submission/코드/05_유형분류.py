@@ -1,5 +1,5 @@
 """
-Phase 6. 이상 유형 분류 및 결과 해석
+Phase 5. 이상 유형 분류 및 결과 해석
 9유형 전부 규칙 기반으로 전체 데이터에 적용.
 is_anomaly==1이지만 어떤 규칙에도 해당하지 않는 행은 패턴이탈형(catch-all)으로 분류.
 SHAP 해석 + 결과 시각화를 수행한다.
@@ -16,7 +16,7 @@ SHAP 해석 + 결과 시각화를 수행한다.
 냉수용은 활성시즌 정의를 반전(냉방시즌=활성).
 
 사용법:
-  python scripts/phase6_classification.py
+  python 05_유형분류.py
 """
 
 import pandas as pd
