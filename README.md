@@ -44,12 +44,12 @@ pip install pandas numpy scikit-learn torch stumpy shap matplotlib pyarrow
 ## 실행 순서
 
 ```bash
-python scripts/phase2_preprocess.py          # 전처리
-python scripts/phase3_feature.py             # 피처 생성
-python scripts/phase4_normal_pattern.py      # GMM 정상 패턴 모델링
-python scripts/phase5_anomaly_detection.py   # 이상 탐지
-python scripts/phase6_classification.py      # 유형 분류
-python scripts/phase7_evaluation.py          # 성능 평가
+python scripts/phase1_preprocess.py          # 전처리
+python scripts/phase2_feature.py             # 피처 생성
+python scripts/phase3_normal_pattern.py      # GMM 정상 패턴 모델링
+python scripts/phase4_anomaly_detection.py   # 이상 탐지
+python scripts/phase5_classification.py      # 유형 분류
+python scripts/phase6_evaluation.py          # 성능 평가
 ```
 
 ## 프로젝트 구조
